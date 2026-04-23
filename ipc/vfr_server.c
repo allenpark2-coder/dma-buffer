@@ -15,6 +15,7 @@
 #include "ipc/vfr_server.h"
 #include "ipc/vfr_ipc_types.h"
 #include "core/vfr_pool.h"
+#include "core/vfr_sync.h"
 #include "platform/platform_adapter.h"
 
 #include <stdlib.h>
@@ -24,12 +25,15 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/epoll.h>
+#include <poll.h>
 #include <stdbool.h>
 
-/* ─── Consumer Session（POOL_DESIGN.md §3.3 簡化版）────────────────────── */
+/* ─── Consumer Session（POOL_DESIGN.md §3.3）────────────────────────────── */
 typedef struct {
     int      socket_fd;
+    int      eventfd;     /* Phase 3：producer→consumer 新幀通知（EFD_SEMAPHORE）*/
     uint32_t session_id;
+    uint32_t policy;      /* Phase 3：vfr_backpressure_t */
     uint32_t refslot[VFR_MAX_CONSUMER_SLOTS];  /* 此 consumer 持有的 slot id */
     uint32_t refslot_count;
     bool     active;
@@ -51,6 +55,11 @@ struct vfr_server {
 static void handle_accepted_client(struct vfr_server *srv, int client_fd);
 static void teardown_session(struct vfr_server *srv, consumer_session_t *sess);
 static void handle_release_msg(struct vfr_server *srv, int client_fd);
+static void force_release_slot(struct vfr_server *srv, consumer_session_t *sess, uint32_t slot_id);
+static int  wait_for_consumer_free(struct vfr_server *srv, consumer_session_t *sess);
+static int  dispatch_to_session(struct vfr_server *srv __attribute__((unused)),
+                                 consumer_session_t *sess, uint32_t slot_idx,
+                                 const vfr_frame_t *meta, int producer_dma_fd);
 
 /* ─── helper：可靠發送（EINTR 安全）────────────────────────────────────── */
 static ssize_t send_all(int fd, const void *buf, size_t len)
@@ -116,7 +125,11 @@ static void teardown_session(struct vfr_server *srv, consumer_session_t *sess)
     /* 3. close client fd（觸發 consumer 端 EPOLLHUP）*/
     close(sess->socket_fd);
     sess->socket_fd = -1;
-    sess->active    = false;
+
+    /* 4. Phase 3：close eventfd */
+    vfr_sync_close_eventfd(&sess->eventfd);
+
+    sess->active = false;
 
     if (srv->session_count > 0) srv->session_count--;
 }
@@ -162,10 +175,20 @@ static void handle_accepted_client(struct vfr_server *srv, int client_fd)
         return;
     }
 
+    /* Phase 3：建立 eventfd（producer→consumer 新幀通知）*/
+    int evfd = vfr_sync_create_eventfd();
+    if (evfd < 0) {
+        VFR_LOGE("vfr_sync_create_eventfd failed");
+        close(client_fd);
+        return;
+    }
+
     uint32_t sid = ++srv->next_session_id;
     memset(sess, 0, sizeof(*sess));
     sess->socket_fd     = client_fd;
+    sess->eventfd       = evfd;
     sess->session_id    = sid;
+    sess->policy        = hello.policy;   /* Phase 3：記錄 backpressure policy */
     sess->refslot_count = 0;
     sess->active        = true;
     srv->session_count++;
@@ -191,6 +214,36 @@ static void handle_accepted_client(struct vfr_server *srv, int client_fd)
         return;
     }
 
+    /* Step 5b: Phase 3 — 發送 vfr_eventfd_setup_t + eventfd（SCM_RIGHTS）*/
+    {
+        vfr_eventfd_setup_t evsetup = { .magic = VFR_SHM_MAGIC, ._pad = 0 };
+        struct iovec iov_ev = { .iov_base = &evsetup, .iov_len = sizeof(evsetup) };
+        union {
+            char           buf[CMSG_SPACE(sizeof(int))];
+            struct cmsghdr align;
+        } cmsg_buf;
+        memset(&cmsg_buf, 0, sizeof(cmsg_buf));
+
+        struct msghdr mhdr_ev;
+        memset(&mhdr_ev, 0, sizeof(mhdr_ev));
+        mhdr_ev.msg_iov        = &iov_ev;
+        mhdr_ev.msg_iovlen     = 1;
+        mhdr_ev.msg_control    = cmsg_buf.buf;
+        mhdr_ev.msg_controllen = sizeof(cmsg_buf.buf);
+
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&mhdr_ev);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type  = SCM_RIGHTS;
+        cmsg->cmsg_len   = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cmsg), &evfd, sizeof(int));
+
+        if (sendmsg(client_fd, &mhdr_ev, MSG_NOSIGNAL) < 0) {
+            VFR_LOGE("send eventfd_setup: %s", strerror(errno));
+            teardown_session(srv, sess);
+            return;
+        }
+    }
+
     /* Step 6: 加入 epoll（EPOLLIN=release_msg, EPOLLHUP=斷線）*/
     struct epoll_event ev = {
         .events  = EPOLLIN | EPOLLHUP | EPOLLERR,
@@ -202,8 +255,8 @@ static void handle_accepted_client(struct vfr_server *srv, int client_fd)
         return;
     }
 
-    VFR_LOGI("new consumer: fd=%d session_id=%u pid=%d (total=%u)",
-             client_fd, sid, (int)hello.consumer_pid, srv->session_count);
+    VFR_LOGI("new consumer: fd=%d session_id=%u pid=%d policy=%u evfd=%d (total=%u)",
+             client_fd, sid, (int)hello.consumer_pid, hello.policy, evfd, srv->session_count);
 }
 
 /* ─── handle_release_msg ─────────────────────────────────────────────────── */
@@ -283,6 +336,12 @@ vfr_server_t *vfr_server_create(const char *stream_name, uint32_t slot_count)
     strncpy(srv->stream_name, stream_name, VFR_SOCKET_NAME_MAX - 1);
     srv->listen_fd = -1;
     srv->epoll_fd  = -1;
+
+    /* 初始化所有 session 的 fd 為 -1（calloc 後為 0 = stdin，必須覆寫）*/
+    for (int i = 0; i < VFR_MAX_CONSUMERS; i++) {
+        srv->sessions[i].socket_fd = -1;
+        srv->sessions[i].eventfd   = -1;
+    }
 
     /* ── Platform + Pool ────────────────────────────────────────────────── */
     const vfr_platform_ops_t *ops;
@@ -400,50 +459,65 @@ int vfr_server_handle_events(vfr_server_t *srv, int timeout_ms)
     return 0;
 }
 
-/* ─── vfr_server_produce ─────────────────────────────────────────────────── */
-int vfr_server_produce(vfr_server_t *srv)
+/* ─── helper：從 refslot[] 移除並呼叫 force_release（DROP_OLDEST 用）────── */
+static void force_release_slot(struct vfr_server *srv, consumer_session_t *sess,
+                                uint32_t slot_id)
 {
-    if (!srv) return -1;
-
-    /* 從 platform 取一幀（FILLING → READY）*/
-    uint32_t slot_idx;
-    int ret = vfr_pool_acquire(srv->pool, &slot_idx);
-    if (ret != 0) return ret;
-
-    /* 取 frame metadata */
-    const vfr_frame_t *meta = vfr_pool_slot_meta(srv->pool, slot_idx);
-    if (!meta) {
-        VFR_LOGE("slot_meta slot[%u] NULL", slot_idx);
-        return -1;
+    /* 先從 refslot[] 移除，確保後續 handle_release_msg 不會再次觸發 server_release */
+    bool found = false;
+    for (uint32_t i = 0; i < sess->refslot_count; i++) {
+        if (sess->refslot[i] == slot_id) {
+            sess->refslot[i] = sess->refslot[--sess->refslot_count];
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        VFR_LOGW("force_release_slot: slot_id=%u not in refslot[]", slot_id);
+        return;
     }
 
-    /* 計算 active consumer 數 */
-    uint32_t n = 0;
-    for (int i = 0; i < VFR_MAX_CONSUMERS; i++) {
-        if (srv->sessions[i].active) n++;
+    /* 遞減 refcount（pool 會在最後一個持有者釋放時 free slot）*/
+    vfr_pool_force_release(srv->pool, slot_id);
+    VFR_LOGD("force_release_slot: session_id=%u slot_id=%u", sess->session_id, slot_id);
+}
+
+/* ─── helper：等待 BLOCK_PRODUCER consumer 釋放 slot（輪詢 socket）─────── */
+/* 單執行緒 server 不能 sleep；直接在 consumer socket 上 poll，接收 release_msg */
+static int wait_for_consumer_free(struct vfr_server *srv, consumer_session_t *sess)
+{
+    if (sess->refslot_count == 0) return 1;
+
+    struct pollfd pfd = { .fd = sess->socket_fd, .events = POLLIN };
+    int elapsed_ms    = 0;
+    const int STEP_MS = 2;
+
+    while (elapsed_ms < VFR_BLOCK_PRODUCER_TIMEOUT_MS && sess->refslot_count > 0) {
+        int ret = poll(&pfd, 1, STEP_MS);
+        if (ret > 0 && (pfd.revents & POLLIN)) {
+            /* 接收 release_msg，更新 refslot_count */
+            handle_release_msg(srv, sess->socket_fd);
+        } else if (ret < 0 && errno != EINTR) {
+            return -1;
+        }
+        if (pfd.revents & (POLLHUP | POLLERR)) return -1;
+        elapsed_ms += STEP_MS;
     }
 
-    if (n == 0) {
-        /* 無 consumer：slot 仍在 READY state，refcount = 0，不可呼叫 server_release
-         * 改用 cancel_acquire 直接通知 platform put_frame 並將 slot 歸還 FREE */
-        vfr_pool_cancel_acquire(srv->pool, slot_idx);
-        VFR_LOGD("no consumers, slot[%u] cancelled", slot_idx);
-        return 0;
-    }
+    return (sess->refslot_count == 0) ? 1 : 0;
+}
 
-    /* Phase B（POOL_DESIGN.md §3.2）：先設 refcount，再發送
-     * 在任何 sendmsg 之前完成，防止 consumer 提前 put_frame 導致 refcount wrap */
-    if (vfr_pool_begin_dispatch(srv->pool, slot_idx, n) < 0) {
-        VFR_LOGE("begin_dispatch slot[%u] failed", slot_idx);
-        return -1;
-    }
-
-    int producer_dma_fd = vfr_pool_slot_dma_fd(srv->pool, slot_idx);
-
-    /* 準備 frame_msg（不含 dma_fd，透過 SCM_RIGHTS 傳）*/
+/* ─── helper：向 consumer 發送一幀（SCM_RIGHTS + eventfd notify）────────── */
+/* 回傳：0 = 成功；-1 = consumer 斷線（已 teardown）*/
+static int dispatch_to_session(struct vfr_server *srv __attribute__((unused)),
+                                consumer_session_t *sess,
+                                uint32_t slot_idx, const vfr_frame_t *meta,
+                                int producer_dma_fd)
+{
     vfr_frame_msg_t msg;
     memset(&msg, 0, sizeof(msg));
     msg.magic           = VFR_SHM_MAGIC;
+    msg.session_id      = sess->session_id;
     msg.slot_id         = slot_idx;
     msg.width           = meta->width;
     msg.height          = meta->height;
@@ -457,51 +531,148 @@ int vfr_server_produce(vfr_server_t *srv)
     msg.plane_offset[1] = meta->plane_offset[1];
     msg.plane_offset[2] = meta->plane_offset[2];
 
-    /* Phase C：逐一 sendmsg（payload + SCM_RIGHTS）*/
+    struct iovec iov = { .iov_base = &msg, .iov_len = sizeof(msg) };
+    union {
+        char           buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } cmsg_buf;
+    memset(&cmsg_buf, 0, sizeof(cmsg_buf));
+
+    struct msghdr mhdr;
+    memset(&mhdr, 0, sizeof(mhdr));
+    mhdr.msg_iov        = &iov;
+    mhdr.msg_iovlen     = 1;
+    mhdr.msg_control    = cmsg_buf.buf;
+    mhdr.msg_controllen = sizeof(cmsg_buf.buf);
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&mhdr);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type  = SCM_RIGHTS;
+    cmsg->cmsg_len   = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &producer_dma_fd, sizeof(int));
+
+    ssize_t sent = sendmsg(sess->socket_fd, &mhdr, MSG_NOSIGNAL);
+    if (sent < 0) {
+        VFR_LOGE("sendmsg session_id=%u fd=%d: %s",
+                 sess->session_id, sess->socket_fd, strerror(errno));
+        return -1;   /* 呼叫方負責 refcount-- 和 teardown */
+    }
+
+    /* Phase 3：通知 consumer 有新幀（eventfd write）
+     * fd 送出後才通知，確保 consumer recvmsg 能取到 fd（POOL_DESIGN.md §3.2 Phase C）*/
+    if (sess->eventfd >= 0) {
+        vfr_sync_notify(sess->eventfd);
+    }
+
+    /* 記錄 refslot（供斷線時 force release）*/
+    if (sess->refslot_count < VFR_MAX_CONSUMER_SLOTS) {
+        sess->refslot[sess->refslot_count++] = slot_idx;
+    }
+
+    VFR_LOGD("dispatch slot[%u] seq=%llu → session_id=%u",
+             slot_idx, (unsigned long long)meta->seq_num, sess->session_id);
+    return 0;
+}
+
+/* ─── vfr_server_produce（Phase 3 Backpressure Dispatch）────────────────── */
+int vfr_server_produce(vfr_server_t *srv)
+{
+    if (!srv) return -1;
+
+    /* 從 platform 取一幀（FILLING → READY）*/
+    uint32_t slot_idx;
+    int ret = vfr_pool_acquire(srv->pool, &slot_idx);
+    if (ret != 0) return ret;
+
+    const vfr_frame_t *meta = vfr_pool_slot_meta(srv->pool, slot_idx);
+    if (!meta) {
+        VFR_LOGE("slot_meta slot[%u] NULL", slot_idx);
+        return -1;
+    }
+
+    /* ── Phase A：決策（POOL_DESIGN.md §3.2）──────────────────────────────
+     * 不傳送，只決定哪些 consumer 本次要接收，並按 policy 處理 backpressure */
+    uint32_t receiver_idx[VFR_MAX_CONSUMERS];
+    uint32_t n = 0;
+
     for (int i = 0; i < VFR_MAX_CONSUMERS; i++) {
         consumer_session_t *sess = &srv->sessions[i];
         if (!sess->active) continue;
 
-        msg.session_id = sess->session_id;
+        switch (sess->policy) {
+        case VFR_POLICY_DROP_OLDEST:
+            /* 若有舊幀未消化：force_release 最舊 slot，確保有空間接收新幀 */
+            if (sess->refslot_count > 0) {
+                force_release_slot(srv, sess, sess->refslot[0]);
+                atomic_fetch_add_explicit(
+                    &srv->shm_hdr.drop_count, 1u, memory_order_relaxed);
+            }
+            receiver_idx[n++] = (uint32_t)i;
+            break;
 
-        struct iovec iov = { .iov_base = &msg, .iov_len = sizeof(msg) };
-        union {
-            char           buf[CMSG_SPACE(sizeof(int))];
-            struct cmsghdr align;
-        } cmsg_buf;
-        memset(&cmsg_buf, 0, sizeof(cmsg_buf));
+        case VFR_POLICY_BLOCK_PRODUCER:
+            /* 若有舊幀：等待 consumer 釋放（最多 1 frame 時間）*/
+            if (sess->refslot_count > 0) {
+                int ok = wait_for_consumer_free(srv, sess);
+                if (ok <= 0) {
+                    VFR_LOGW("BLOCK_PRODUCER session_id=%u timeout, downgrade to DROP_OLDEST",
+                             sess->session_id);
+                    if (sess->refslot_count > 0) {
+                        force_release_slot(srv, sess, sess->refslot[0]);
+                        atomic_fetch_add_explicit(
+                            &srv->shm_hdr.drop_count, 1u, memory_order_relaxed);
+                    }
+                }
+            }
+            receiver_idx[n++] = (uint32_t)i;
+            break;
 
-        struct msghdr mhdr;
-        memset(&mhdr, 0, sizeof(mhdr));
-        mhdr.msg_iov        = &iov;
-        mhdr.msg_iovlen     = 1;
-        mhdr.msg_control    = cmsg_buf.buf;
-        mhdr.msg_controllen = sizeof(cmsg_buf.buf);
+        case VFR_POLICY_SKIP_SELF:
+            /* 若有舊幀未消化：跳過本幀 */
+            if (sess->refslot_count > 0) {
+                VFR_LOGD("SKIP_SELF session_id=%u: has slot, skipping frame", sess->session_id);
+                continue;
+            }
+            receiver_idx[n++] = (uint32_t)i;
+            break;
 
-        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&mhdr);
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type  = SCM_RIGHTS;
-        cmsg->cmsg_len   = CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(cmsg), &producer_dma_fd, sizeof(int));
+        default:
+            /* 未知 policy：當作 DROP_OLDEST 處理 */
+            receiver_idx[n++] = (uint32_t)i;
+            break;
+        }
+    }
 
-        ssize_t sent = sendmsg(sess->socket_fd, &mhdr, MSG_NOSIGNAL);
-        if (sent < 0) {
-            /* EPIPE / ECONNRESET：consumer 在兩個 phase 之間死亡 */
-            VFR_LOGE("sendmsg session_id=%u fd=%d: %s", sess->session_id, sess->socket_fd,
-                     strerror(errno));
-            /* 遞減 refcount，防止 slot 永遠不回收 */
+    if (n == 0) {
+        vfr_pool_cancel_acquire(srv->pool, slot_idx);
+        VFR_LOGD("no receivers for slot[%u], cancelled", slot_idx);
+        return 0;
+    }
+
+    /* ── Phase B：先設 refcount，再開始任何 sendmsg ─────────────────────
+     * 必須在第一個 write(eventfd) 之前完成，防止 consumer 提前 put_frame 導致
+     * refcount wrap（POOL_DESIGN.md §3.2 "關鍵約束"）*/
+    if (vfr_pool_begin_dispatch(srv->pool, slot_idx, n) < 0) {
+        VFR_LOGE("begin_dispatch slot[%u] failed", slot_idx);
+        return -1;
+    }
+
+    int producer_dma_fd = vfr_pool_slot_dma_fd(srv->pool, slot_idx);
+
+    /* ── Phase C：逐一發送（sendmsg + eventfd notify）──────────────────── */
+    for (uint32_t r = 0; r < n; r++) {
+        consumer_session_t *sess = &srv->sessions[receiver_idx[r]];
+        if (!sess->active) {
+            /* 在 Phase A→C 之間 consumer 已死亡（tombstone=true 不適用，直接 dec）*/
             vfr_pool_server_release(srv->pool, slot_idx, meta->seq_num);
-            teardown_session(srv, sess);
             continue;
         }
 
-        /* 記錄 refslot（供斷線時 force release）*/
-        if (sess->refslot_count < VFR_MAX_CONSUMER_SLOTS) {
-            sess->refslot[sess->refslot_count++] = slot_idx;
+        if (dispatch_to_session(srv, sess, slot_idx, meta, producer_dma_fd) < 0) {
+            /* sendmsg 失敗：EPIPE，consumer 在 Phase B→C 之間死亡 */
+            vfr_pool_server_release(srv->pool, slot_idx, meta->seq_num);
+            teardown_session(srv, sess);
         }
-
-        VFR_LOGD("dispatch slot[%u] seq=%llu → session_id=%u",
-                 slot_idx, (unsigned long long)meta->seq_num, sess->session_id);
     }
 
     return 0;

@@ -61,7 +61,8 @@ static ssize_t send_all(int fd, const void *buf, size_t len)
 }
 
 /* ─── vfr_client_connect ─────────────────────────────────────────────────── */
-int vfr_client_connect(const char *stream_name, vfr_client_state_t *out_state)
+int vfr_client_connect(const char *stream_name, vfr_client_state_t *out_state,
+                       uint32_t policy)
 {
     if (!stream_name || !out_state) return -1;
 
@@ -98,6 +99,8 @@ int vfr_client_connect(const char *stream_name, vfr_client_state_t *out_state)
         .reserved      = 0,
         .consumer_pid  = (int32_t)getpid(),
         .consumer_uid  = (uint32_t)getuid(),
+        .policy        = policy,
+        ._pad2         = 0,
     };
     if (send_all(sock, &hello, sizeof(hello)) < 0) {
         VFR_LOGE("send hello failed: %s", strerror(errno));
@@ -157,14 +160,54 @@ int vfr_client_connect(const char *stream_name, vfr_client_state_t *out_state)
         return -1;
     }
 
+    /* ── Step 4: 接收 vfr_eventfd_setup_t + eventfd（SCM_RIGHTS）────────── */
+    /* Phase 3：server 在 shm_header 之後發送 eventfd，供 consumer 做 epoll_wait */
+    vfr_eventfd_setup_t evsetup;
+    union {
+        char             buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr   align;
+    } cmsg_buf;
+    struct iovec iov_ev  = { .iov_base = &evsetup, .iov_len  = sizeof(evsetup) };
+    struct msghdr mhdr_ev;
+    memset(&mhdr_ev, 0, sizeof(mhdr_ev));
+    mhdr_ev.msg_iov        = &iov_ev;
+    mhdr_ev.msg_iovlen     = 1;
+    mhdr_ev.msg_control    = cmsg_buf.buf;
+    mhdr_ev.msg_controllen = sizeof(cmsg_buf.buf);
+
+    ssize_t nr = recvmsg(sock, &mhdr_ev, MSG_WAITALL);
+    if (nr < (ssize_t)sizeof(evsetup)) {
+        VFR_LOGE("recv eventfd_setup failed (got %zd): %s", nr, strerror(errno));
+        close(sock);
+        return -1;
+    }
+    if (evsetup.magic != VFR_SHM_MAGIC) {
+        VFR_LOGE("eventfd_setup magic mismatch 0x%08x", evsetup.magic);
+        close(sock);
+        return -1;
+    }
+
+    int evfd = -1;
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&mhdr_ev);
+    if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS
+            && cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+        memcpy(&evfd, CMSG_DATA(cmsg), sizeof(int));
+    }
+    if (evfd < 0) {
+        VFR_LOGE("no eventfd received in SCM_RIGHTS");
+        close(sock);
+        return -1;
+    }
+
     /* 成功：填入 out_state */
     memset(out_state, 0, sizeof(*out_state));
     out_state->socket_fd  = sock;
+    out_state->eventfd    = evfd;
     out_state->session_id = shake.session_id;
     out_state->shm_hdr    = shm_hdr;
 
-    VFR_LOGI("connected to stream '%s' session_id=%u %ux%u",
-             stream_name, shake.session_id, shm_hdr.width, shm_hdr.height);
+    VFR_LOGI("connected to stream '%s' session_id=%u %ux%u evfd=%d",
+             stream_name, shake.session_id, shm_hdr.width, shm_hdr.height, evfd);
     return 0;
 }
 
@@ -285,10 +328,23 @@ int vfr_client_send_release(vfr_client_ref_t *ref)
     return 0;
 }
 
+/* ─── vfr_client_get_eventfd ─────────────────────────────────────────────── */
+int vfr_client_get_eventfd(const vfr_client_state_t *state)
+{
+    if (!state) return -1;
+    return state->eventfd;
+}
+
 /* ─── vfr_client_disconnect ──────────────────────────────────────────────── */
 void vfr_client_disconnect(vfr_client_state_t *state)
 {
     if (!state) return;
+
+    /* Phase 3：呼叫者必須在此之前從自己的 epoll 登出 eventfd */
+    if (state->eventfd >= 0) {
+        close(state->eventfd);
+        state->eventfd = -1;
+    }
     if (state->socket_fd >= 0) {
         close(state->socket_fd);
         state->socket_fd = -1;

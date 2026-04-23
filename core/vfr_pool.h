@@ -120,4 +120,18 @@ int vfr_pool_slot_dma_fd(vfr_pool_t *pool, uint32_t slot_idx);
  */
 void vfr_pool_server_release(vfr_pool_t *pool, uint32_t slot_id, uint64_t seq_num);
 
+/*
+ * vfr_pool_force_release()：
+ *   Phase 3 DROP_OLDEST 使用。
+ *   先設定 slot->tombstone = true，再原子遞減 refcount。
+ *   若降為 0，通知 platform put_frame 並轉為 FREE，同時清除 tombstone。
+ *
+ *   效果：
+ *   - 此後若有遲到的 vfr_release_msg_t（consumer 舊幀的 put_frame），
+ *     server_release() 看到 tombstone=true 會直接 skip，不做雙重釋放。
+ *   - 若 tombstone 設好後 refcount 已為 0（其他 consumer 更早釋放），
+ *     此函式負責最終清理。
+ */
+void vfr_pool_force_release(vfr_pool_t *pool, uint32_t slot_id);
+
 #endif /* VFR_POOL_H */

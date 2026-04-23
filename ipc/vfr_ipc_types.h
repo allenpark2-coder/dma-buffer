@@ -24,6 +24,8 @@ typedef struct {
     uint16_t reserved;        /* 填 0，保留對齊 */
     int32_t  consumer_pid;    /* 供 server 做 pidfd_open()（Phase 4）*/
     uint32_t consumer_uid;    /* 供 SO_PEERCRED 補充驗證（選做）*/
+    uint32_t policy;          /* Phase 3 新增：vfr_backpressure_t（drop_oldest=0 預設）*/
+    uint32_t _pad2;           /* 對齊至 8-byte 邊界 */
 } vfr_client_hello_t;
 
 /* ─── Server → Client：握手成功回應 ─────────────────────────────────────── */
@@ -34,6 +36,16 @@ typedef struct {
     uint32_t session_id;      /* server 分配的唯一識別碼，供 vfr_release_msg_t 驗證 */
     uint32_t _pad;            /* 對齊 */
 } vfr_handshake_t;
+
+/* ─── Server → Client：Phase 3 新增 — eventfd 設定（握手最後一步）─────────
+ * server 在發完 vfr_shm_header_t 後，發送此訊息並在 SCM_RIGHTS 中攜帶 eventfd fd。
+ * consumer 收到後將 eventfd 存入 vfr_client_state_t.eventfd。
+ * 此 eventfd 為 producer→consumer 新幀通知；每幀 dispatch 後 server 寫入一次。
+ */
+typedef struct {
+    uint32_t magic;   /* VFR_SHM_MAGIC */
+    uint32_t _pad;
+} vfr_eventfd_setup_t;
 
 /* ─── Server → Client：版本不符時發送後關閉連線 ─────────────────────────── */
 typedef struct {

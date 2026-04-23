@@ -28,6 +28,8 @@ typedef struct {
 /* ─── Client 連線狀態（存入 vfr_ctx_t）────────────────────────────────── */
 typedef struct {
     int              socket_fd;
+    int              eventfd;    /* Phase 3：producer→consumer 新幀通知 fd（server 透過 SCM_RIGHTS 傳來）
+                                  * 由框架持有，consumer 只可加入 epoll，不得 close() 它 */
     uint32_t         session_id;
     vfr_shm_header_t shm_hdr;    /* 從 server 收到的格式協商資料 */
     vfr_client_ref_t slot_ref;   /* 當前持有幀的 back-ref（最多一幀） */
@@ -35,12 +37,22 @@ typedef struct {
 
 /*
  * vfr_client_connect()：
- *   連線到 \0/vfr/<stream_name>，執行握手。
- *   成功後填入 out_state。
+ *   連線到 \0/vfr/<stream_name>，執行握手（含 Phase 3 eventfd 接收）。
+ *   policy — vfr_backpressure_t，傳遞給 server 決定 dispatch 策略。
+ *   成功後填入 out_state（含 eventfd）。
  *
  * 回傳：0 = 成功；-1 = 失敗
  */
-int vfr_client_connect(const char *stream_name, vfr_client_state_t *out_state);
+int vfr_client_connect(const char *stream_name, vfr_client_state_t *out_state,
+                       uint32_t policy);
+
+/*
+ * vfr_client_get_eventfd()：
+ *   回傳 state->eventfd（Phase 3 producer→consumer 通知 fd）。
+ *   ownership：fd 由框架持有，consumer 只可加入 epoll，不得 close()。
+ *   呼叫 vfr_client_disconnect() 前，consumer 必須先從自己的 epoll 登出此 fd。
+ */
+int vfr_client_get_eventfd(const vfr_client_state_t *state);
 
 /*
  * vfr_client_recv_frame()：

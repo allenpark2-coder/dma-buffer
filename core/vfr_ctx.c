@@ -79,20 +79,35 @@ vfr_ctx_t *vfr_open(const char *stream_name, uint32_t slot_count)
     strncpy(ctx->stream_name, stream_name, VFR_SOCKET_NAME_MAX - 1);
     ctx->stream_name[VFR_SOCKET_NAME_MAX - 1] = '\0';
     ctx->client.socket_fd = -1;  /* 初始化為無效 fd */
+    ctx->client.eventfd   = -1;  /* Phase 3：初始化 eventfd 為 -1 */
 
     /* 模式判斷 */
     const char *mode_env = getenv("VFR_MODE");
     ctx->is_client = (mode_env && strcmp(mode_env, "client") == 0);
 
     if (ctx->is_client) {
-        /* ── Client Mode（Phase 2）──────────────────────────────────────── */
-        if (vfr_client_connect(stream_name, &ctx->client) != 0) {
+        /* ── Client Mode（Phase 2/3）────────────────────────────────────── */
+
+        /* Phase 3：從環境變數讀取 backpressure policy */
+        uint32_t policy = VFR_BP_DROP_OLDEST;   /* 預設 */
+        const char *pol_env = getenv("VFR_POLICY");
+        if (pol_env) {
+            if (strcmp(pol_env, "block_producer") == 0)
+                policy = VFR_BP_BLOCK_PRODUCER;
+            else if (strcmp(pol_env, "skip_self") == 0)
+                policy = VFR_BP_SKIP_SELF;
+            else if (strcmp(pol_env, "drop_oldest") != 0)
+                VFR_LOGW("unknown VFR_POLICY='%s', using drop_oldest", pol_env);
+        }
+
+        if (vfr_client_connect(stream_name, &ctx->client, policy) != 0) {
             VFR_LOGE("vfr_client_connect('%s') failed", stream_name);
             free(ctx);
             return NULL;
         }
-        VFR_LOGI("vfr_open(client): stream='%s' session_id=%u",
-                 stream_name, ctx->client.session_id);
+        VFR_LOGI("vfr_open(client): stream='%s' session_id=%u policy=%u evfd=%d",
+                 stream_name, ctx->client.session_id, policy,
+                 ctx->client.eventfd);
     } else {
         /* ── Standalone Mode（Phase 1）──────────────────────────────────── */
         ctx->shm_hdr.magic      = VFR_SHM_MAGIC;
@@ -230,10 +245,11 @@ int vfr_get_eventfd(vfr_ctx_t *ctx)
     if (!ctx) return -1;
 
     if (ctx->is_client) {
-        /* Phase 2：consumer 可以直接 epoll 監聽 socket_fd（等效 eventfd）*/
-        return ctx->client.socket_fd;
+        /* Phase 3：回傳 server 在握手時傳來的 eventfd
+         * fd 由框架持有；consumer 只可加入自己的 epoll，不得 close() */
+        return vfr_client_get_eventfd(&ctx->client);
     }
 
-    /* Phase 1 standalone：尚未實作 eventfd（Phase 3）*/
+    /* Standalone mode（Phase 1）：無 eventfd */
     return -1;
 }

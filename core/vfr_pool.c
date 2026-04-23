@@ -293,6 +293,40 @@ int vfr_pool_begin_dispatch(vfr_pool_t *pool, uint32_t slot_idx, uint32_t n_cons
     return 0;
 }
 
+/* ─── vfr_pool_force_release（Phase 3 DROP_OLDEST 用）──────────────────── */
+/* IPC 模式下不設 tombstone（由呼叫方先從 refslot[] 移除，handle_release_msg 不會
+ * 再次觸發 server_release；tombstone 留給 standalone put_slot 路徑使用）*/
+void vfr_pool_force_release(vfr_pool_t *pool, uint32_t slot_id)
+{
+    if (!pool || slot_id >= pool->slot_count) {
+        VFR_LOGW("force_release: invalid slot_id=%u", slot_id);
+        return;
+    }
+
+    vfr_islot_t *slot = &pool->islots[slot_id];
+
+    uint32_t prev = atomic_fetch_sub_explicit(&slot->refcount, 1u, memory_order_acq_rel);
+    if (prev == 0) {
+        /* 不應發生：防止 uint32 wrap */
+        VFR_LOGE("force_release slot[%u]: refcount was already 0!", slot_id);
+        atomic_fetch_add_explicit(&slot->refcount, 1u, memory_order_relaxed);
+        return;
+    }
+
+    if (prev == 1) {
+        /* 最後一個持有者：通知 platform 回收 producer buffer */
+        if (pool->platform && pool->platform->put_frame) {
+            pool->platform->put_frame(pool->platform_ctx, &slot->frame_meta);
+        }
+        slot->frame_meta.dma_fd = -1;
+        atomic_store_explicit(&slot->tombstone, false, memory_order_release);
+        atomic_store_explicit(&slot->state, (int)SLOT_FREE, memory_order_release);
+        VFR_LOGD("force_release slot[%u]: freed (last consumer)", slot_id);
+    } else {
+        VFR_LOGD("force_release slot[%u]: refcount now %u", slot_id, prev - 1);
+    }
+}
+
 /* ─── vfr_pool_slot_meta（Phase 2 Server 用）───────────────────────────── */
 const vfr_frame_t *vfr_pool_slot_meta(vfr_pool_t *pool, uint32_t slot_idx)
 {

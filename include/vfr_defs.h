@@ -12,7 +12,7 @@
 
 /* ─── 版本與識別 ────────────────────────────────────────────────────────── */
 #define VFR_SHM_MAGIC           0x56465231u   /* "VFR1" */
-#define VFR_PROTO_VERSION       1u            /* IPC 握手協議版本；struct 新增欄位時遞增 */
+#define VFR_PROTO_VERSION       2u            /* IPC 握手協議版本；v2 新增 policy 欄位、eventfd 握手 */
 
 /* ─── Buffer Pool ───────────────────────────────────────────────────────── */
 #define VFR_DEFAULT_SLOTS       8             /* vfr_open() slot_count 預設值 */
@@ -30,7 +30,8 @@
 #define VFR_SOCKET_NAME_MAX     64            /* stream name 最大長度（bytes），防止 path overflow */
 
 /* ─── Watchdog ──────────────────────────────────────────────────────────── */
-#define VFR_WATCHDOG_TIMEOUT_MS  2000         /* Phase 4 watchdog：偵測 consumer process 死亡的超時 */
+#define VFR_WATCHDOG_TIMEOUT_MS     2000      /* Phase 4 watchdog：偵測 consumer process 死亡的超時 */
+#define VFR_BLOCK_PRODUCER_TIMEOUT_MS 33     /* BLOCK_PRODUCER slot wait timeout（1 frame @ 30fps）*/
 
 /* ─── vfr_get_frame() flags ─────────────────────────────────────────────── */
 #define VFR_FLAG_NONBLOCK    (1u << 0)

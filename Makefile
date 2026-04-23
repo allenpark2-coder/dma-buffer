@@ -1,5 +1,5 @@
 # VFR — Video Frame Reader
-# Phase 1 + Phase 2 Makefile
+# Phase 1 + Phase 2 + Phase 3 Makefile
 
 CC      = gcc
 CFLAGS  = -Wall -Wextra -std=c11 -D_GNU_SOURCE
@@ -21,6 +21,9 @@ SRCS_CORE = \
     core/vfr_pool.c \
     sdk/vfr_map.c
 
+SRCS_SYNC = \
+    core/vfr_sync.c
+
 SRCS_MOCK = \
     platform/mock/mock_adapter.c
 
@@ -39,22 +42,30 @@ SRCS_TEST_PRODUCER = \
 SRCS_TEST_CONSUMER = \
     test/test_ipc_consumer.c
 
-# ─── targets ───────────────────────────────────────────────────────────────────
-.PHONY: all clean valgrind asan check check2
+SRCS_TEST_MULTICAST = \
+    test/test_multicast.c
 
-all: test_single_proc test_ipc_producer test_ipc_consumer
+# ─── targets ───────────────────────────────────────────────────────────────────
+.PHONY: all clean valgrind asan check check2 check3
+
+all: test_single_proc test_ipc_producer test_ipc_consumer test_multicast
 
 # ── Phase 1 ────────────────────────────────────────────────────────────────────
-test_single_proc: $(SRCS_CORE) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_TEST_SINGLE)
+test_single_proc: $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_TEST_SINGLE)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
 
 # ── Phase 2 ────────────────────────────────────────────────────────────────────
-# Producer：包含 server + pool + mock adapter（server 端需要 platform adapter）
-test_ipc_producer: $(SRCS_CORE) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_IPC_SERVER) $(SRCS_TEST_PRODUCER)
+# Producer：server 用到 vfr_sync.c（eventfd helper）
+test_ipc_producer: $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_IPC_SERVER) $(SRCS_TEST_PRODUCER)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
 
-# Consumer：包含 client + pool（vfr_ctx.c 引用 pool 型別）+ mock adapter（standalone fallback）
-test_ipc_consumer: $(SRCS_CORE) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_TEST_CONSUMER)
+# Consumer：client + pool + sync（vfr_ctx.c 引用 vfr_sync）
+test_ipc_consumer: $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_TEST_CONSUMER)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+
+# ── Phase 3 ────────────────────────────────────────────────────────────────────
+# test_multicast：單一 binary，--role producer|rtsp|recorder|motion
+test_multicast: $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_IPC_SERVER) $(SRCS_TEST_MULTICAST)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
 
 # ── Phase 1 驗證 ──────────────────────────────────────────────────────────────
@@ -113,7 +124,39 @@ valgrind2: test_ipc_producer test_ipc_consumer
 	kill $$PROD_PID; wait $$PROD_PID; \
 	exit $$RESULT
 
+# ── Phase 3 驗證（3 consumer 同時跑）────────────────────────────────────────
+# check3：啟動 producer，再依序啟動 3 個 consumer（RTSP/Recorder/Motion）
+# 全部完成後驗證整體結果
+check3: test_multicast
+	@echo "=== Running Phase 3 Multicast Test ==="
+	@./test_multicast --role producer --frames 200 &
+	@PROD_PID=$$!; \
+	sleep 0.3; \
+	VFR_MODE=client VFR_POLICY=drop_oldest    ./test_multicast --role rtsp     --frames 40 & RTSP_PID=$$!; \
+	VFR_MODE=client VFR_POLICY=block_producer ./test_multicast --role recorder --frames 15 & REC_PID=$$!; \
+	VFR_MODE=client VFR_POLICY=skip_self      ./test_multicast --role motion   --frames 25 & MOT_PID=$$!; \
+	wait $$RTSP_PID;   RTSP_RET=$$?; \
+	wait $$REC_PID;    REC_RET=$$?; \
+	wait $$MOT_PID;    MOT_RET=$$?; \
+	kill $$PROD_PID 2>/dev/null; wait $$PROD_PID 2>/dev/null; \
+	echo "=== RTSP:     $$([ $$RTSP_RET -eq 0 ] && echo PASS || echo FAIL) ==="; \
+	echo "=== RECORDER: $$([ $$REC_RET -eq 0 ]  && echo PASS || echo FAIL) ==="; \
+	echo "=== MOTION:   $$([ $$MOT_RET -eq 0 ]  && echo PASS || echo FAIL) ==="; \
+	OVERALL=$$(( $$RTSP_RET | $$REC_RET | $$MOT_RET )); \
+	echo "=== Phase 3 Overall: $$([ $$OVERALL -eq 0 ] && echo PASS || echo FAIL) ==="; \
+	exit $$OVERALL
+
+# ── ASan 驗收（Phase 3 checklist 3.4）──────────────────────────────────────
+asan3:
+	$(CC) $(CFLAGS) $(INCLUDES) \
+	    -fsanitize=address,undefined \
+	    -fno-omit-frame-pointer \
+	    -o test_multicast_asan \
+	    $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_IPC_SERVER) $(SRCS_TEST_MULTICAST)
+	@echo "=== ASan build OK. Run: make check3 with asan binary for full validation ==="
+
 clean:
 	rm -f test_single_proc test_single_proc_asan
 	rm -f test_ipc_producer test_ipc_consumer
+	rm -f test_multicast test_multicast_asan
 	rm -f /tmp/frame_*.yuv
