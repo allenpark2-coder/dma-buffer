@@ -8,8 +8,20 @@
 #include "vfr.h"
 #include "platform/platform_adapter.h"
 
-/* opaque pool handle；實際定義在 vfr_pool.c */
+/* ─── frame->priv 模式標記（判斷 pool ref vs client ref）─────────────── */
+/* 兩個 ref struct 均以此 uint32_t 為第一個欄位，供 vfr_put_frame() 辨識 */
+#define VFR_PRIV_POOL    0u   /* vfr_slot_ref_t（Phase 1 + server side） */
+#define VFR_PRIV_CLIENT  1u   /* vfr_client_ref_t（Phase 2 consumer side） */
+
+/* ─── Pool 內部 back-reference（存入 frame->priv）─────────────────────── */
+/* 前向宣告 struct vfr_pool，因為 vfr_slot_ref_t 在 pool 內部定義之前就需要被引用 */
 typedef struct vfr_pool vfr_pool_t;
+
+typedef struct {
+    uint32_t         mode;      /* VFR_PRIV_POOL */
+    vfr_pool_t      *pool;
+    uint32_t         slot_idx;
+} vfr_slot_ref_t;
 
 /* ─── Pool 生命週期 ──────────────────────────────────────────────────────── */
 
@@ -54,10 +66,58 @@ int vfr_pool_dispatch_single(vfr_pool_t *pool, uint32_t slot_idx, vfr_frame_t *o
 
 /*
  * vfr_pool_put_slot()：
- *   由 vfr_put_frame() 內部呼叫。
+ *   由 vfr_put_frame() 內部呼叫（Phase 1 standalone mode）。
  *   原子遞減 refcount；若降為 0，呼叫 platform->put_frame() 並將 slot 轉為 FREE。
  *   frame->dma_fd 在此函式中 close 並設為 -1。
  */
 void vfr_pool_put_slot(vfr_pool_t *pool, vfr_frame_t *frame);
+
+/* ─── Phase 2 Server 端操作 ──────────────────────────────────────────────── */
+
+/*
+ * vfr_pool_cancel_acquire()：
+ *   在 vfr_pool_acquire() 成功後、但無 consumer 需要接收時呼叫。
+ *   直接呼叫 platform->put_frame() 並將 slot 設回 FREE。
+ *   不得與 vfr_pool_begin_dispatch() 混用。
+ */
+void vfr_pool_cancel_acquire(vfr_pool_t *pool, uint32_t slot_idx);
+
+/*
+ * vfr_pool_begin_dispatch()：
+ *   Server 在 sendmsg 之前呼叫。
+ *   設定 slot->refcount = n_consumers，並將 slot 轉為 IN_FLIGHT。
+ *   必須在第一個 sendmsg 之前完成（POOL_DESIGN.md §3.2 Phase B）。
+ *
+ * 回傳：0 = 成功；-1 = slot 狀態不符（不在 READY state）
+ */
+int vfr_pool_begin_dispatch(vfr_pool_t *pool, uint32_t slot_idx, uint32_t n_consumers);
+
+/*
+ * vfr_pool_slot_meta()：
+ *   取得 slot 的 frame metadata（唯讀）。
+ *   呼叫者不得修改或釋放回傳指標。
+ *
+ * 回傳：metadata 指標；slot_idx 越界時回傳 NULL
+ */
+const vfr_frame_t *vfr_pool_slot_meta(vfr_pool_t *pool, uint32_t slot_idx);
+
+/*
+ * vfr_pool_slot_dma_fd()：
+ *   取得 slot 的 producer 端 dma_fd（用於 SCM_RIGHTS sendmsg）。
+ *   此 fd 由 pool 持有，呼叫者不得 close。
+ *
+ * 回傳：fd（>= 0）；越界或無效時回傳 -1
+ */
+int vfr_pool_slot_dma_fd(vfr_pool_t *pool, uint32_t slot_idx);
+
+/*
+ * vfr_pool_server_release()：
+ *   Server 收到 vfr_release_msg_t 時呼叫（Phase 2）。
+ *   原子遞減 slot refcount；若降為 0，呼叫 platform->put_frame() + SLOT_FREE。
+ *   seq_num = 0 時跳過 seq 驗證（force release，斷線清理用）。
+ *
+ *   注意：此函式不 close consumer 端的 dma_fd（那是 consumer 的責任）。
+ */
+void vfr_pool_server_release(vfr_pool_t *pool, uint32_t slot_id, uint64_t seq_num);
 
 #endif /* VFR_POOL_H */

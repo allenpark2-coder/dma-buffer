@@ -175,6 +175,12 @@ static int mock_get_frame(void *ctx, vfr_frame_t *out)
         fill_nv12_pattern(buf, m->width, m->height, m->stride, m->seq_num);
     }
 
+    /* Zero-copy 驗證：在 buffer 起始位置寫入 magic number（Phase 2 驗收條件）
+     * consumer mmap 後讀到相同值，證明兩端操作的是同一塊實體記憶體 */
+    if (m->buf_size >= sizeof(uint32_t)) {
+        *(uint32_t *)buf = 0xDEADBEEFu;
+    }
+
     munmap(buf, m->buf_size);
 
     /* 取 timestamp */

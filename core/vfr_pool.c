@@ -26,12 +26,6 @@ typedef enum {
     SLOT_IN_FLIGHT   = 3,
 } slot_state_t;
 
-/* ─── 內部 back-reference（嵌入 islot，供 frame->priv 指向）──────────────── */
-typedef struct {
-    struct vfr_pool *pool;
-    uint32_t         slot_idx;
-} vfr_slot_ref_t;
-
 /* ─── Internal slot（含 back-ref）──────────────────────────────────────── */
 typedef struct {
     _Atomic int         state;       /* slot_state_t */
@@ -94,6 +88,7 @@ vfr_pool_t *vfr_pool_create(const vfr_platform_ops_t *ops, uint32_t slot_count,
         atomic_store(&p->islots[i].refcount,  0u);
         atomic_store(&p->islots[i].tombstone, false);
         p->islots[i].frame_meta.dma_fd = -1;
+        p->islots[i].ref.mode          = VFR_PRIV_POOL;
         p->islots[i].ref.pool          = p;
         p->islots[i].ref.slot_idx      = i;
     }
@@ -247,5 +242,116 @@ void vfr_pool_put_slot(vfr_pool_t *pool_hint, vfr_frame_t *frame)
         atomic_store_explicit(&slot->tombstone, false, memory_order_release);
         atomic_store_explicit(&slot->state, (int)SLOT_FREE, memory_order_release);
         VFR_LOGD("put_slot slot[%u]: freed", idx);
+    }
+}
+
+/* ─── vfr_pool_cancel_acquire（Phase 2 Server 用）──────────────────────── */
+/* 在 acquire() 後、但無 consumer 時呼叫，直接釋放 slot 回 FREE */
+void vfr_pool_cancel_acquire(vfr_pool_t *pool, uint32_t slot_idx)
+{
+    if (!pool || slot_idx >= pool->slot_count) return;
+    vfr_islot_t *slot = &pool->islots[slot_idx];
+
+    if (pool->platform && pool->platform->put_frame) {
+        pool->platform->put_frame(pool->platform_ctx, &slot->frame_meta);
+    }
+    slot->frame_meta.dma_fd = -1;
+    atomic_store_explicit(&slot->state, (int)SLOT_FREE, memory_order_release);
+    VFR_LOGD("cancel_acquire slot[%u]", slot_idx);
+}
+
+/* ─── vfr_pool_begin_dispatch（Phase 2 Server 用）──────────────────────── */
+int vfr_pool_begin_dispatch(vfr_pool_t *pool, uint32_t slot_idx, uint32_t n_consumers)
+{
+    if (!pool || slot_idx >= pool->slot_count) {
+        VFR_LOGE("begin_dispatch: invalid args (pool=%p slot_idx=%u)", (void*)pool, slot_idx);
+        return -1;
+    }
+    if (n_consumers == 0) {
+        VFR_LOGW("begin_dispatch: n_consumers=0");
+        return -1;
+    }
+
+    vfr_islot_t *slot = &pool->islots[slot_idx];
+
+    /* 驗證 slot 狀態（應在 READY，acquire() 已設定）*/
+    int expected_ready = SLOT_READY;
+    /* 也接受 FILLING（acquire→READY 是非原子多步，容許短暫的 FILLING 狀態）*/
+    int cur = atomic_load_explicit(&slot->state, memory_order_acquire);
+    if (cur != SLOT_READY && cur != SLOT_FILLING) {
+        VFR_LOGE("begin_dispatch: slot[%u] not in READY state (state=%d)", slot_idx, cur);
+        return -1;
+    }
+    (void)expected_ready;
+
+    /* Phase B（POOL_DESIGN.md §3.2）：先設 refcount，再標記 IN_FLIGHT
+     * 所有 sendmsg 必須在此之後才能開始，確保 consumer 看到正確的 refcount */
+    atomic_store_explicit(&slot->refcount, n_consumers, memory_order_release);
+    atomic_store_explicit(&slot->state, (int)SLOT_IN_FLIGHT, memory_order_release);
+
+    VFR_LOGD("begin_dispatch slot[%u] n_consumers=%u", slot_idx, n_consumers);
+    return 0;
+}
+
+/* ─── vfr_pool_slot_meta（Phase 2 Server 用）───────────────────────────── */
+const vfr_frame_t *vfr_pool_slot_meta(vfr_pool_t *pool, uint32_t slot_idx)
+{
+    if (!pool || slot_idx >= pool->slot_count) return NULL;
+    return &pool->islots[slot_idx].frame_meta;
+}
+
+/* ─── vfr_pool_slot_dma_fd（Phase 2 Server 用）─────────────────────────── */
+int vfr_pool_slot_dma_fd(vfr_pool_t *pool, uint32_t slot_idx)
+{
+    if (!pool || slot_idx >= pool->slot_count) return -1;
+    return pool->islots[slot_idx].frame_meta.dma_fd;
+}
+
+/* ─── vfr_pool_server_release（Phase 2 Server 用）──────────────────────── */
+/* 收到 vfr_release_msg_t 後呼叫，不 close consumer fd（那是 consumer 的責任）*/
+void vfr_pool_server_release(vfr_pool_t *pool, uint32_t slot_id, uint64_t seq_num)
+{
+    if (!pool || slot_id >= pool->slot_count) {
+        VFR_LOGW("invalid slot_id=%u", slot_id);
+        return;
+    }
+
+    vfr_islot_t *slot = &pool->islots[slot_id];
+
+    /* seq_num 驗證（防止過期回收；seq_num=0 = force release，跳過驗證）*/
+    if (seq_num != 0 && slot->frame_meta.seq_num != seq_num) {
+        VFR_LOGW("slot[%u] seq mismatch: got %llu expect %llu (stale release?)", slot_id,
+                 (unsigned long long)seq_num,
+                 (unsigned long long)slot->frame_meta.seq_num);
+        return;
+    }
+
+    /* tombstone check */
+    if (atomic_load_explicit(&slot->tombstone, memory_order_acquire)) {
+        VFR_LOGD("server_release slot[%u]: tombstone set, skip", slot_id);
+        return;
+    }
+
+    /* 原子遞減 refcount */
+    uint32_t prev = atomic_fetch_sub_explicit(&slot->refcount, 1u, memory_order_acq_rel);
+    if (prev == 0) {
+        /* 不應發生：防止 wrap-around */
+        VFR_LOGE("server_release slot[%u]: refcount was already 0!", slot_id);
+        /* 回補，防止 uint32 wrap */
+        atomic_fetch_add_explicit(&slot->refcount, 1u, memory_order_relaxed);
+        return;
+    }
+
+    if (prev == 1) {
+        /* 最後一個 consumer 釋放：通知 platform 回收 producer buffer */
+        if (pool->platform && pool->platform->put_frame) {
+            pool->platform->put_frame(pool->platform_ctx, &slot->frame_meta);
+        }
+        slot->frame_meta.dma_fd = -1;
+        atomic_store_explicit(&slot->tombstone, false, memory_order_release);
+        atomic_store_explicit(&slot->state, (int)SLOT_FREE, memory_order_release);
+        VFR_LOGD("server_release slot[%u]: freed (last consumer)", slot_id);
+    } else {
+        VFR_LOGD("server_release slot[%u]: refcount now %u", slot_id, prev - 1);
     }
 }
