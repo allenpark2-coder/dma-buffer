@@ -1,0 +1,10 @@
+# Build outputs
+test_single_proc
+test_single_proc_asan
+test_ipc_producer
+test_ipc_consumer
+test_multicast
+test_multicast_asan
+
+# Test frame dumps
+/tmp/frame_*.yuv
