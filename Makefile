@@ -1,12 +1,12 @@
 # VFR — Video Frame Reader
-# Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 Makefile
+# Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 + Recorder Phase R1 Makefile
 
 CC      = gcc
 CFLAGS  = -Wall -Wextra -std=c11 -D_GNU_SOURCE
 # -I.       : allows #include "platform/platform_adapter.h", "core/vfr_pool.h", "ipc/..."
 # -Iinclude : allows #include "vfr_defs.h", #include "vfr.h"
 # -Icore    : allows #include "vfr_pool.h" (from vfr_ctx.c)
-INCLUDES = -I. -Iinclude -Icore
+INCLUDES = -I. -Iinclude -Icore -Irec
 
 ifdef DEBUG
   CFLAGS  += -g -O0 -DVFR_LOG_LEVEL=3
@@ -59,10 +59,23 @@ SRCS_REGISTRY = \
 SRCS_TEST_METRICS = \
     test/test_metrics.c
 
-# ─── targets ───────────────────────────────────────────────────────────────────
-.PHONY: all clean valgrind asan check check2 check3 check4 check5 check5-serve asan5
+# ── Recorder Phase R1 ─────────────────────────────────────────────────────────
+SRCS_REC_BUF = \
+    rec/rec_buf.c
 
-all: test_single_proc test_ipc_producer test_ipc_consumer test_multicast test_crash_recovery test_metrics
+SRCS_REC_STATE = \
+    rec/rec_buf.c \
+    rec/rec_schedule.c \
+    rec/rec_debounce.c \
+    rec/rec_trigger.c \
+    rec/rec_state.c
+
+# ─── targets ───────────────────────────────────────────────────────────────────
+.PHONY: all clean valgrind asan check check2 check3 check4 check5 check5-serve asan5 \
+        test_rec_buf check_r1 asan_r1 \
+        test_rec_state check_r2 asan_r2
+
+all: test_single_proc test_ipc_producer test_ipc_consumer test_multicast test_crash_recovery test_metrics test_rec_buf test_rec_state
 
 # ── Phase 1 ────────────────────────────────────────────────────────────────────
 test_single_proc: $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_TEST_SINGLE)
@@ -273,6 +286,45 @@ asan5:
 	    $(SRCS_IPC_SERVER) $(SRCS_METRICS) $(SRCS_REGISTRY) $(SRCS_TEST_METRICS)
 	./test_metrics_asan
 
+# ── Recorder Phase R1 targets ─────────────────────────────────────────────────
+test_rec_buf: $(SRCS_REC_BUF) test/test_rec_buf.c
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+
+test_rec_state: $(SRCS_REC_STATE) test/test_rec_state.c
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+
+# ── Phase R1 驗收 ─────────────────────────────────────────────────────────────
+check_r1: test_rec_buf
+	@echo "=== Running Phase R1 rec_buf Tests ==="
+	./test_rec_buf
+	@RESULT=$$?; \
+	echo "=== Phase R1 Overall: $$([ $$RESULT -eq 0 ] && echo PASS || echo FAIL) ==="; \
+	exit $$RESULT
+
+# ── Phase R1 ASan 驗收 ────────────────────────────────────────────────────────
+asan_r1:
+	$(CC) $(CFLAGS) $(INCLUDES) \
+	    -fsanitize=address,undefined \
+	    -fno-omit-frame-pointer \
+	    -o test_rec_buf_asan \
+	    $(SRCS_REC_BUF) test/test_rec_buf.c
+	./test_rec_buf_asan
+
+check_r2: test_rec_state
+	@echo "=== Running Phase R2 rec_state Tests ==="
+	./test_rec_state
+	@RESULT=$$?; \
+	echo "=== Phase R2 Overall: $$([ $$RESULT -eq 0 ] && echo PASS || echo FAIL) ==="; \
+	exit $$RESULT
+
+asan_r2:
+	$(CC) $(CFLAGS) $(INCLUDES) \
+	    -fsanitize=address,undefined \
+	    -fno-omit-frame-pointer \
+	    -o test_rec_state_asan \
+	    $(SRCS_REC_STATE) test/test_rec_state.c
+	./test_rec_state_asan
+
 clean:
 	rm -f test_single_proc test_single_proc_asan
 	rm -f test_ipc_producer test_ipc_consumer
@@ -281,4 +333,6 @@ clean:
 	rm -f test_metrics test_metrics_asan
 	rm -f bridge_opencv.o test_opencv_bridge
 	rm -f bridge_gstreamer.o test_gstreamer_bridge
+	rm -f test_rec_buf test_rec_buf_asan
+	rm -f test_rec_state test_rec_state_asan
 	rm -f /tmp/frame_*.yuv

@@ -37,6 +37,13 @@
 #define VFR_FLAG_NONBLOCK    (1u << 0)
 #define VFR_FLAG_NO_CPU_SYNC (1u << 1)
 
+/* ─── Encoded Stream Flags（Phase 5+ Recorder 用）────────────────────────── */
+#define VFR_FLAG_KEY_FRAME   (1u << 2)   /* I-Frame / IDR，Recorder 對齊起點 */
+
+/* ─── Encoded Format fourcc ─────────────────────────────────────────────── */
+#define VFR_FMT_H264   0x34363248u   /* 'H264' */
+#define VFR_FMT_H265   0x35363248u   /* 'H265' / 'HEVC' */
+
 /* ─── Backpressure policy values（與 vfr_backpressure_t enum 值一致）──────── */
 #define VFR_POLICY_DROP_OLDEST    0
 #define VFR_POLICY_BLOCK_PRODUCER 1
