@@ -8,3 +8,6 @@ test_multicast_asan
 
 # Test frame dumps
 /tmp/frame_*.yuv
+
+# Git worktrees
+.worktrees/
