@@ -1,5 +1,5 @@
 # VFR — Video Frame Reader
-# Phase 1 + Phase 2 + Phase 3 + Phase 4 Makefile
+# Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 Makefile
 
 CC      = gcc
 CFLAGS  = -Wall -Wextra -std=c11 -D_GNU_SOURCE
@@ -49,10 +49,20 @@ SRCS_TEST_MULTICAST = \
 SRCS_TEST_CRASH = \
     test/test_crash_recovery.c
 
-# ─── targets ───────────────────────────────────────────────────────────────────
-.PHONY: all clean valgrind asan check check2 check3 check4
+# ── Phase 5 ────────────────────────────────────────────────────────────────────
+SRCS_METRICS = \
+    sdk/vfr_metrics.c
 
-all: test_single_proc test_ipc_producer test_ipc_consumer test_multicast test_crash_recovery
+SRCS_REGISTRY = \
+    ipc/vfr_registry.c
+
+SRCS_TEST_METRICS = \
+    test/test_metrics.c
+
+# ─── targets ───────────────────────────────────────────────────────────────────
+.PHONY: all clean valgrind asan check check2 check3 check4 check5 check5-serve asan5
+
+all: test_single_proc test_ipc_producer test_ipc_consumer test_multicast test_crash_recovery test_metrics
 
 # ── Phase 1 ────────────────────────────────────────────────────────────────────
 test_single_proc: $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_TEST_SINGLE)
@@ -198,9 +208,77 @@ asan4:
 	    $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_IPC_SERVER) $(SRCS_TEST_CRASH)
 	./test_crash_recovery_asan --self-test
 
+# ── Phase 5 — Metrics + Bridges（純 C 部分無外部依賴）──────────────────────
+# test_metrics：metrics unit tests + serve 模式 + registry daemon
+test_metrics: $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) \
+              $(SRCS_IPC_SERVER) $(SRCS_METRICS) $(SRCS_REGISTRY) $(SRCS_TEST_METRICS)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+
+# ── Phase 5 — OpenCV Bridge（需 WITH_OPENCV=1）─────────────────────────────
+ifdef WITH_OPENCV
+  CXX           ?= g++
+  OPENCV_CFLAGS := $(shell pkg-config --cflags opencv4 2>/dev/null || \
+                           pkg-config --cflags opencv  2>/dev/null)
+  OPENCV_LIBS   := $(shell pkg-config --libs   opencv4 2>/dev/null || \
+                           pkg-config --libs   opencv  2>/dev/null)
+
+bridge_opencv.o: sdk/bridge_opencv.cpp sdk/bridge_opencv.h include/vfr.h
+	$(CXX) -std=c++11 $(CFLAGS) $(INCLUDES) $(OPENCV_CFLAGS) -c -o $@ $<
+
+test_opencv_bridge: sdk/vfr_map.c platform/mock/mock_adapter.c bridge_opencv.o
+	$(CXX) -std=c++11 $(CFLAGS) $(INCLUDES) $(OPENCV_CFLAGS) \
+	    -o $@ $^ $(OPENCV_LIBS)
+	@echo "[Phase 5] OpenCV bridge built OK"
+endif
+
+# ── Phase 5 — GStreamer Bridge（需 WITH_GSTREAMER=1）─────────────────────────
+ifdef WITH_GSTREAMER
+  GST_CFLAGS := $(shell pkg-config --cflags gstreamer-1.0 gstreamer-app-1.0 \
+                         gstreamer-allocators-1.0 2>/dev/null)
+  GST_LIBS   := $(shell pkg-config --libs   gstreamer-1.0 gstreamer-app-1.0 \
+                         gstreamer-allocators-1.0 2>/dev/null)
+
+bridge_gstreamer.o: sdk/bridge_gstreamer.c sdk/bridge_gstreamer.h include/vfr.h
+	$(CC) $(CFLAGS) $(INCLUDES) $(GST_CFLAGS) -DHAVE_GSTREAMER -c -o $@ $<
+
+test_gstreamer_bridge: sdk/vfr_map.c platform/mock/mock_adapter.c bridge_gstreamer.o
+	$(CC) $(CFLAGS) $(INCLUDES) $(GST_CFLAGS) -DHAVE_GSTREAMER \
+	    -o $@ $^ $(GST_LIBS)
+	@echo "[Phase 5] GStreamer bridge built OK"
+endif
+
+# ── Phase 5 驗收（單元測試）──────────────────────────────────────────────
+check5: test_metrics
+	@echo "=== Running Phase 5 Metrics Unit Tests ==="
+	./test_metrics
+	@RESULT=$$?; \
+	echo "=== Phase 5 Overall: $$([ $$RESULT -eq 0 ] && echo PASS || echo FAIL) ==="; \
+	exit $$RESULT
+
+# ── Phase 5 HTTP scrape 驗收（互動式）───────────────────────────────────
+# 啟動 metrics HTTP server，用 curl 手動驗證：
+#   curl http://127.0.0.1:9100/metrics
+check5-serve: test_metrics
+	@echo "=== Phase 5 Metrics HTTP Server ==="
+	@echo "=== In another terminal: curl http://127.0.0.1:9100/metrics ==="
+	./test_metrics --serve
+
+# ── ASan 驗收（Phase 5）─────────────────────────────────────────────────
+asan5:
+	$(CC) $(CFLAGS) $(INCLUDES) \
+	    -fsanitize=address,undefined \
+	    -fno-omit-frame-pointer \
+	    -o test_metrics_asan \
+	    $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) \
+	    $(SRCS_IPC_SERVER) $(SRCS_METRICS) $(SRCS_REGISTRY) $(SRCS_TEST_METRICS)
+	./test_metrics_asan
+
 clean:
 	rm -f test_single_proc test_single_proc_asan
 	rm -f test_ipc_producer test_ipc_consumer
 	rm -f test_multicast test_multicast_asan
 	rm -f test_crash_recovery test_crash_recovery_asan
+	rm -f test_metrics test_metrics_asan
+	rm -f bridge_opencv.o test_opencv_bridge
+	rm -f bridge_gstreamer.o test_gstreamer_bridge
 	rm -f /tmp/frame_*.yuv
