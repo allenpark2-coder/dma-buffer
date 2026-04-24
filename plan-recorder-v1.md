@@ -61,7 +61,7 @@ Recording Engine 盡量不改動 VFR 核心。唯一需要新增的是：
 | `format` | `V4L2_PIX_FMT_NV12` | `VFR_FMT_H264` / `VFR_FMT_H265` |
 | `buf_size` | YUV 總大小 | **Encoded frame 實際大小**（變長）|
 | `flags` | `VFR_FLAG_NO_CPU_SYNC` | 新增 `VFR_FLAG_KEY_FRAME` |
-| `stride` | luma pitch | 改放 `stream_id`（多路時識別）|
+| `stride` | luma pitch | 改放 `stream_id`（多路時識別）；存取必須透過 `REC_FRAME_STREAM_ID()` macro（見 rec_defs.h）|
 | `plane_offset[3]` | Y/U/V 偏移 | 全部 reserved（填 0）|
 | `timestamp_ns` | capture 時間 | IAV PTS 換算為 ns |
 | `seq_num` | 幀序號 | 同上 |
@@ -69,9 +69,20 @@ Recording Engine 盡量不改動 VFR 核心。唯一需要新增的是：
 
 ### 2.3 Backpressure Policy
 
-Recorder 使用 `VFR_BP_BLOCK_PRODUCER`（完整性優先），因為：
-- 錄影不能丟幀
-- Disk I/O 由異步 Write Queue 吸收，不會長時間阻塞 producer
+Recorder 在 **VFR 層**使用 `VFR_BP_BLOCK_PRODUCER`（完整性優先）：
+- 保護 VFR slot 不被 server 端強制回收
+- 讓 VFR producer（IAV adapter）等待，而非丟失幀
+
+**注意：VFR 層保幀 ≠ Write Queue 不丟幀。**  
+兩層語意必須分開理解：
+
+| 層級 | 機制 | 溢出行為 | 說明 |
+|------|------|----------|------|
+| VFR consumer slot | `BLOCK_PRODUCER` | producer 等待 | 保護幀不被覆蓋，正常路徑 |
+| Write Queue（內部） | SPSC bounded queue | `drop_count++`，不 crash | 磁碟 I/O 過載的最後防線 |
+
+Write Queue 溢出屬於**磁碟 I/O 過載**情境（寫入速度跟不上攝影機輸出），此時 drop 是預期且可接受的行為。  
+Write Queue 溢出**不得** block event loop；應記錄 drop_count 供監控告警。
 
 ---
 
@@ -120,6 +131,19 @@ vfr/
 /* ─── 延時 ───────────────────────────────────────────────────────── */
 #define REC_POST_RECORD_SEC_DEFAULT  30  /* 觸發消失後繼續錄影 30 秒 */
 #define REC_DEBOUNCE_MS              500 /* 500 ms 內重複觸發視為同一事件 */
+
+/* ─── epoll fd 上限 ──────────────────────────────────────────────── */
+/* 目前已知 fd 來源：VFR eventfd(1) + AI trigger socket(1) + timerfd(1) */
+#define REC_MAX_EPOLL_FDS  8             /* 保留 2x 彈性，caller buffer 至少此大小 */
+
+/* ─── stream_id accessor（stride 欄位語意重用）────────────────────── */
+/*
+ * vfr_frame_t.stride 在 encoded 模式下存放 stream_id。
+ * 使用 macro 存取，避免 implicit reuse 造成混淆。
+ * 未來如 VFR 新增 priv 欄位，改此 macro 即可，呼叫端不動。
+ */
+#define REC_FRAME_STREAM_ID(frame)        ((uint32_t)(frame)->stride)
+#define REC_FRAME_SET_STREAM_ID(frame, id) ((frame)->stride = (uint32_t)(id))
 
 /* ─── 錄影模式 ───────────────────────────────────────────────────── */
 typedef enum {
@@ -171,7 +195,31 @@ typedef struct rec_buf {
     uint32_t           index_head;   /* 最老的幀（FIFO head）*/
     uint32_t           index_tail;   /* 下一個寫入位置 */
     uint32_t           index_count;  /* 目前幀數 */
+
+    /*
+     * Writer thread 正在讀取的 ring 起始偏移（Issue #1）。
+     * Event loop 在 wrap-around 前必須確認新幀的 byte range
+     * 不與 [protected_read_offset, protected_read_offset + protected_read_size) 重疊；
+     * 若有重疊，需等 Writer 完成當次讀取後才能覆蓋。
+     * Writer 讀取前設定此欄位，讀取完畢後清為 REC_PROTECT_NONE。
+     *
+     * 型別為 _Atomic uint64_t，低 32 bit = offset，高 32 bit = size（或用兩個 atomic）。
+     * 此欄位僅在 EXTRACT_PRE 至 Writer 完成預錄段讀取期間有效。
+     */
+    _Atomic uint32_t   protected_read_offset; /* REC_PROTECT_NONE = UINT32_MAX */
+    _Atomic uint32_t   protected_read_size;
 } rec_buf_t;
+
+#define REC_PROTECT_NONE  UINT32_MAX
+
+/*
+ * rec_buf_push() 內部淘汰規則（Index Table 與 byte ring 同步）：
+ *
+ * 在寫入新幀前，若新幀的 byte range [write_pos, write_pos + size) 會覆蓋
+ * index[index_head] 的 [offset, offset + size) 範圍，
+ * 則先推進 index_head（丟棄最老幀的 index entry），重複直到無重疊。
+ * 此邏輯確保 index entry 的 offset 永遠指向有效（未被覆蓋）的 ring 資料。
+ */
 ```
 
 ### 4.3 Write Queue 元素
@@ -184,8 +232,20 @@ typedef struct {
     uint64_t  timestamp_ns;
     bool      is_keyframe;
     bool      is_segment_boundary;  /* Writer 看到此旗標時切換新檔案 */
+                                    /* 由 rec_segment.c 在 enqueue 前設定 */
 } rec_write_item_t;
 ```
+
+**Write Queue 資料所有權規則（Issue #2）：**
+
+| 動作 | 執行方 | 說明 |
+|------|--------|------|
+| `malloc(item->data)` | Producer（event loop） | enqueue 前分配，複製幀資料後送入 queue |
+| `free(item->data)` | Writer thread | dequeue 後，`write()` 完成即釋放 |
+| destroy 時排空 queue | Writer thread 先執行 | Writer 收到 shutdown 訊號後，繼續排空 queue 並逐一 `free(data)`，然後 thread 自行結束 |
+| `rec_engine_destroy()` 等待 | Event loop 端 | `pthread_join(writer_thread)` 確保 Writer 完全結束後，才釋放 `rec_engine_t` 及 `rec_buf_t` |
+
+此規則確保：Write Queue 中任何未寫的 item 不會在 destroy 流程中 leak。
 
 ---
 
@@ -271,14 +331,16 @@ Ambarella IAV5/6 的 bitstream buffer 以 `mmap` 方式共享給 userspace。
                                        ▼
                     ┌──────────────────────────────────────────────┐
                     │ REC_STATE_EXTRACT_PRE                        │
-                    │ 動作：                                       │
+                    │ 動作（event loop，僅做 index 操作）：        │
                     │  1. 從 Index Table 找最近 I-Frame            │
                     │     距現在 ≥ N 秒的那個                      │
-                    │  2. 將 [I-Frame .. ring tail] 全部           │
-                    │     複製到 Write Queue                       │
-                    │  3. 立即切換至 IN_EVENT                     │
+                    │  2. 將 [I-Frame .. ring tail] 的             │
+                    │     index entry（offset+size）送入 pre-queue │
+                    │     ★ 不在此做 memcpy，不阻塞 event loop ★  │
+                    │  3. 設定 ring protected_read_offset          │
+                    │  4. 立即切換至 IN_EVENT                     │
                     └──────────────────┬───────────────────────────┘
-                                       │ 提取完成（單次，< 1ms）
+                                       │ 提取完成（單次，僅 index 操作 < 0.1ms）
                                        ▼
                     ┌──────────────────────────────────────────────┐
                     │ REC_STATE_IN_EVENT                           │
@@ -302,30 +364,58 @@ Ambarella IAV5/6 的 bitstream buffer 以 `mmap` 方式共享給 userspace。
 
 ### 7.2 EXTRACT_PRE 對齊演算法
 
+**設計原則（Issue #1 修正）：**  
+Event loop thread **只做 index 掃描與指標記錄**，不執行 memcpy。  
+實際的 byte 複製由 Writer thread 在讀取 pre-queue 時從 ring buf 讀出。  
+Ring buf 以 `protected_read_offset / protected_read_size` 保護預錄區間不被 wrap-around 覆蓋。
+
 ```
+─── Event loop thread（EXTRACT_PRE 進入時執行，< 0.1ms）──────────
+
 輸入：
   pre_sec  — 目標預錄秒數（e.g. 10s）
   now_ns   — 當前時間（CLOCK_MONOTONIC）
 
-演算法：
-  target_ns = now_ns - pre_sec * 1e9
+1. 計算目標時間
+   target_ns = now_ns - pre_sec * 1_000_000_000
 
-  // 從 index_head 掃描，找第一個 timestamp >= target_ns 且 is_keyframe == true
-  for i in [index_head .. index_tail):
-      if index[i].timestamp_ns >= target_ns and index[i].is_keyframe:
-          start_idx = i
-          break
+2. 掃描 Index Table，找起始 keyframe
+   for i in [index_head .. index_tail):
+       if index[i].timestamp_ns >= target_ns and index[i].is_keyframe:
+           start_idx = i
+           break
+   if not found:
+       start_idx = 最老的 keyframe index
 
-  // 若找不到 keyframe（緩衝區太短），取最老的 keyframe
-  if not found:
-      start_idx = 最老的 keyframe index
+3. 保護 ring buf 區間，防止 Writer 讀取期間被 wrap-around 覆蓋
+   // 計算 [start_idx .. index_tail) 的 byte 起始偏移
+   protect_start = index[start_idx].offset
+   atomic_store(&ring->protected_read_offset, protect_start)
+   atomic_store(&ring->protected_read_size,   ring->write_pos - protect_start)
+   // （ring 為環形，需做模運算；若 write_pos < protect_start 代表已環繞）
 
-  // 將 [start_idx .. index_tail) 的幀依序塞入 Write Queue
-  for i in [start_idx .. index_tail):
-      enqueue(Write Queue, copy_frame(index[i]))
+4. 將 [start_idx .. index_tail) 的 index entry 依序推入 pre_extract_queue
+   for i in [start_idx .. index_tail):
+       enqueue(pre_extract_queue, index[i])   // 只複製 ~32 bytes entry，無 memcpy 幀資料
+
+5. 立即轉移到 IN_EVENT（event loop 不等待 Writer）
+
+─── Writer thread（從 pre_extract_queue 消費）──────────────────
+
+for each entry in pre_extract_queue:
+    memcpy(tmp_buf, ring->ring + entry.offset, entry.size)   // 從 ring 讀取幀資料
+    enqueue(Write Queue, tmp_buf, entry.size, ...)            // 送入正式 Write Queue
+    // 每讀完一個 entry，檢查是否已讀完全部預錄 entry；
+    // 讀完後清除 ring 保護：
+    //   atomic_store(&ring->protected_read_offset, REC_PROTECT_NONE)
+
+─── rec_buf_push() wrap-around 保護（event loop）──────────────
+
+// 寫入新幀前，若新幀的 [write_pos, write_pos+size) 與 protected 區間重疊，
+// 則自旋等待（預期 Writer 很快讀完，ns 級；若超過 1ms 則記錄 warning）
+while overlaps(write_pos, size, protected_read_offset, protected_read_size):
+    cpu_relax()
 ```
-
-此操作在 event loop thread 執行，需保證 < 1ms（15MB / memcpy 速度 ≈ 0.1ms）。
 
 ---
 
@@ -362,7 +452,29 @@ rec_slot_mode_t rec_schedule_query(const rec_schedule_t *sched,
 }
 ```
 
-排程引擎每分鐘（或每格邊界）呼叫一次，若模式改變則通知 State Machine。
+### 8.3 計時器驅動（Issue #4 & #5 修正）
+
+排程邊界切換與 POST_WAIT 倒數共用同一個 **1 秒週期 `timerfd`**：
+
+```c
+/* rec_engine_create() 內部初始化 */
+int timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+struct itimerspec its = {
+    .it_interval = { .tv_sec = 1, .tv_nsec = 0 },
+    .it_value    = { .tv_sec = 1, .tv_nsec = 0 },
+};
+timerfd_settime(timer_fd, 0, &its, NULL);
+/* timer_fd 加入 rec_engine_get_epoll_fds() 回傳列表 */
+```
+
+每次 timerfd 觸發（EPOLLIN）時，`rec_engine_handle_event()` 執行：
+1. **POST_WAIT 倒數**：`post_remaining_sec--`；若歸零且無新觸發，轉移至 IDLE
+2. **排程邊界檢查**：每 60 次 tick（= 1 分鐘）呼叫 `rec_schedule_query()` 一次；  
+   若當前 15 分鐘格邊界，立即查詢；若模式改變，通知 State Machine
+
+**為什麼不靠幀間隔計時？**  
+低 fps（1 fps）場景下，幀間隔最長 1 秒，計時精度差；且 IDLE 狀態可能長時間無幀。
+timerfd 精度為 CLOCK_MONOTONIC，不受 NTP 跳秒影響。
 
 ---
 
@@ -441,8 +553,16 @@ rec_engine_t *rec_engine_create(const rec_config_t *cfg);
 
 /*
  * rec_engine_get_epoll_fds()：
- *   回傳需加入呼叫者 epoll 的 fd 列表（VFR eventfd、AI trigger socket）。
+ *   回傳需加入呼叫者 epoll 的 fd 列表。
  *   呼叫者負責將這些 fd 加入自己的 epoll，並在 EPOLLIN 時呼叫 rec_engine_handle_event()。
+ *
+ *   目前回傳的 fd（依序，共 3 個）：
+ *     [0] VFR consumer eventfd    — 新幀到達通知
+ *     [1] AI trigger socket fd    — 跨 process 觸發訊號（Unix abstract socket）
+ *     [2] timerfd（1 秒週期）     — POST_WAIT 倒數 + 排程邊界切換
+ *
+ *   max_fds 建議傳入 REC_MAX_EPOLL_FDS（定義於 rec_defs.h）。
+ *   回傳值：實際填入的 fd 數量；< 0 表示錯誤。
  */
 int rec_engine_get_epoll_fds(rec_engine_t *eng, int *fds_out, int max_fds);
 
@@ -537,7 +657,7 @@ uint32_t    rec_engine_get_dropped_frames(const rec_engine_t *eng);  /* Write Qu
 - `test/test_rec_full.c`：端到端測試
 
 驗收 Checklist：
-- [ ] 24/7 模式：持續錄影 1 小時，每 10 分鐘自動分段，無幀遺漏
+- [ ] 24/7 模式：持續錄影 1 小時，每 10 分鐘自動分段，**無幀遺漏**（前提：磁碟寫入速度足夠，`drop_count == 0`；CI 測試應先斷言此值）
 - [ ] 事件模式：AI trigger → 預錄對齊 I-Frame → 錄影 → POST_WAIT → 結束
 - [ ] 排程模式：時段 off → 無輸出；時段 continuous → 正常錄影
 - [ ] 跨 process 觸發：AI process 送 `vfr_event_msg_t`，Recorder 正確響應
@@ -552,13 +672,17 @@ uint32_t    rec_engine_get_dropped_frames(const rec_engine_t *eng);  /* Write Qu
 |----------|------|
 | 在 event loop thread 呼叫 `write()` | 磁碟 I/O 阻塞，所有 VFR 幀事件卡死 |
 | 在 event loop thread 呼叫 `sleep()` / `usleep()` | 同上 |
-| Writer thread 直接讀取 `rec_buf_t`（無鎖保護） | Data race；ring buf 僅 event loop thread 讀寫 |
-| Write Queue 溢出時 block event loop 等待 | 應 drop frame 並遞增 `drop_count`，不阻塞 |
+| 在 event loop thread 對大型 buffer 執行 `memcpy()`（> 數 KB） | ARM DDR 競爭下，15MB memcpy 可達 2~5ms，VFR eventfd 無人 drain；EXTRACT_PRE 只做 index entry enqueue，memcpy 由 Writer thread 執行 |
+| Writer thread 直接讀取 `rec_buf_t`（不設 protected_read_offset） | Data race；ring buf 可能在 Writer 讀取期間被 wrap-around 覆蓋；必須先設定保護區間 |
+| Write Queue 溢出時 block event loop 等待 | 應 drop frame 並遞增 `drop_count`，不阻塞；VFR 層的 BLOCK_PRODUCER 與 Write Queue drop 是兩個不同層級的機制 |
 | 錄影段從非 I-Frame 開始 | 解碼器輸出綠屏或崩潰 |
 | 使用 `signal()` 設定 handler | 多執行緒行為未定義；改用 `sigaction()` |
 | EXTRACT_PRE 期間持有 VFR slot | `VFR_MAX_CONSUMER_SLOTS=4`，預錄需數百幀，必須在 event loop 中 memcpy 後立即 `vfr_put_frame()` |
 | 直接存取 `vfr_server_t` 或 `vfr_pool_t` 內部欄位 | 違反 VFR opaque 設計；改用公開 API |
 | Write Queue 使用 mutex（主路徑）| SPSC queue 用 atomic index；mutex 僅用於 flush / destroy |
+| `free(item->data)` 在 event loop 端執行 | data 所有權屬 Writer thread；destroy 時必須 join Writer 後才能釋放 engine |
+| 直接讀寫 `vfr_frame_t.stride` 當 stream_id | 語意不明；改用 `REC_FRAME_STREAM_ID()` / `REC_FRAME_SET_STREAM_ID()` |
+| POST_WAIT / 排程切換靠「每幀到達時檢查時間差」驅動 | 低 fps 或 IDLE 時幀間隔長，計時精度差；應靠 1 秒週期 timerfd |
 
 ---
 
@@ -624,5 +748,6 @@ checkR4: test_rec_full
 
 ---
 
-*文件版本：v1.0 — 2026-04-24*
+*文件版本：v1.1 — 2026-04-24*
+*v1.1 修正：10 個設計問題（3 🔴 / 4 🟡 / 3 🟢），詳見 issue 審查記錄*
 *基於 plan-vfr-cross-platform-v2.md v2.4 設計，VFR 為幀來源層，Recorder 為 VFR 消費者模組*
