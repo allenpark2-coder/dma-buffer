@@ -50,4 +50,19 @@ int vfr_server_produce(vfr_server_t *srv);
  */
 void vfr_server_destroy(vfr_server_t **srv);
 
+/* ─── Phase 4：監控介面（供 metrics 系統讀取）─────────────────────────────── */
+
+/*
+ * vfr_server_get_drop_count()：
+ *   讀取 SHM header 的 drop_count（原子操作，任何時刻可呼叫）。
+ *   drop_count 在 DROP_OLDEST 觸發時遞增，代表被丟棄的幀數。
+ */
+uint32_t vfr_server_get_drop_count(const vfr_server_t *srv);
+
+/*
+ * vfr_server_get_session_count()：
+ *   回傳目前已連線的 consumer 數量。
+ */
+uint32_t vfr_server_get_session_count(const vfr_server_t *srv);
+
 #endif /* VFR_SERVER_H */

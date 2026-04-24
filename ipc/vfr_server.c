@@ -14,6 +14,7 @@
 
 #include "ipc/vfr_server.h"
 #include "ipc/vfr_ipc_types.h"
+#include "ipc/vfr_watchdog.h"
 #include "core/vfr_pool.h"
 #include "core/vfr_sync.h"
 #include "platform/platform_adapter.h"
@@ -27,11 +28,14 @@
 #include <sys/epoll.h>
 #include <poll.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 
 /* ─── Consumer Session（POOL_DESIGN.md §3.3）────────────────────────────── */
 typedef struct {
     int      socket_fd;
     int      eventfd;     /* Phase 3：producer→consumer 新幀通知（EFD_SEMAPHORE）*/
+    int      pidfd;       /* Phase 4：監控 consumer process 存活（pidfd_open）*/
+    pid_t    pid;         /* Phase 4：consumer PID，供 vfr_watchdog_open() 使用 */
     uint32_t session_id;
     uint32_t policy;      /* Phase 3：vfr_backpressure_t */
     uint32_t refslot[VFR_MAX_CONSUMER_SLOTS];  /* 此 consumer 持有的 slot id */
@@ -95,6 +99,16 @@ static consumer_session_t *find_session_by_fd(struct vfr_server *srv, int fd)
     return NULL;
 }
 
+/* ─── helper：根據 pidfd 找 session（Phase 4 watchdog 用）──────────────── */
+static consumer_session_t *find_session_by_pidfd(struct vfr_server *srv, int fd)
+{
+    for (int i = 0; i < VFR_MAX_CONSUMERS; i++) {
+        if (srv->sessions[i].active && srv->sessions[i].pidfd == fd)
+            return &srv->sessions[i];
+    }
+    return NULL;
+}
+
 /* ─── helper：根據 session_id 找 session ─────────────────────────────── */
 static consumer_session_t *find_session_by_id(struct vfr_server *srv, uint32_t sid)
 {
@@ -105,31 +119,46 @@ static consumer_session_t *find_session_by_id(struct vfr_server *srv, uint32_t s
     return NULL;
 }
 
-/* ─── teardown_session（原則五順序）────────────────────────────────────── */
+/* ─── teardown_session（Phase 4 原則五順序）───────────────────────────── */
 static void teardown_session(struct vfr_server *srv, consumer_session_t *sess)
 {
     if (!sess || !sess->active) return;
 
-    VFR_LOGI("teardown session_id=%u fd=%d (refslot_count=%u)",
-             sess->session_id, sess->socket_fd, sess->refslot_count);
+    VFR_LOGI("teardown session_id=%u fd=%d pid=%d (refslot_count=%u)",
+             sess->session_id, sess->socket_fd, (int)sess->pid, sess->refslot_count);
 
-    /* 1. 從 epoll 登出（close(fd) 之前）*/
-    epoll_ctl(srv->epoll_fd, EPOLL_CTL_DEL, sess->socket_fd, NULL);
+    /* 1. 標記 tombstone：設 active=false 防止 event loop 重複 teardown
+     *    必須在任何 epoll_ctl DEL 之前，防止後續遞迴觸發 */
+    sess->active = false;
 
-    /* 2. 回收此 consumer 持有的所有 slot */
+    /* 2. 從 epoll 登出所有 fd（必須在 close 之前）
+     *    依序：socket_fd → pidfd（Phase 4 新增）*/
+    if (sess->socket_fd >= 0)
+        epoll_ctl(srv->epoll_fd, EPOLL_CTL_DEL, sess->socket_fd, NULL);
+    if (sess->pidfd >= 0)
+        epoll_ctl(srv->epoll_fd, EPOLL_CTL_DEL, sess->pidfd, NULL);
+
+    /* 4. close(client_fd)（觸發 consumer 端 EPOLLHUP） */
+    if (sess->socket_fd >= 0) {
+        close(sess->socket_fd);
+        sess->socket_fd = -1;
+    }
+
+    /* 4b. Phase 3：close eventfd */
+    vfr_sync_close_eventfd(&sess->eventfd);
+
+    /* 4c. Phase 4：close pidfd */
+    vfr_watchdog_close(&sess->pidfd);
+
+    /* 5. 歸還此 consumer 持有的所有 slot（close 本地 dma_fd 複製）
+     *    seq_num=0 = force release（跳過 seq 驗證）*/
     for (uint32_t i = 0; i < sess->refslot_count; i++) {
         vfr_pool_server_release(srv->pool, sess->refslot[i], 0 /* seq=0=force */);
     }
     sess->refslot_count = 0;
 
-    /* 3. close client fd（觸發 consumer 端 EPOLLHUP）*/
-    close(sess->socket_fd);
-    sess->socket_fd = -1;
-
-    /* 4. Phase 3：close eventfd */
-    vfr_sync_close_eventfd(&sess->eventfd);
-
-    sess->active = false;
+    /* 6. 從 consumer 陣列清除（pid 重置）*/
+    sess->pid = 0;
 
     if (srv->session_count > 0) srv->session_count--;
 }
@@ -183,10 +212,17 @@ static void handle_accepted_client(struct vfr_server *srv, int client_fd)
         return;
     }
 
+    /* Phase 4：開啟 pidfd 監控 consumer process 存活 */
+    int watchdog_fd = vfr_watchdog_open((pid_t)hello.consumer_pid);
+    /* watchdog_fd = -1 表示不支援（kernel < 5.3）或 process 已死；
+     * 繼續接受連線，只是無法透過 pidfd 偵測崩潰（socket HUP 仍可偵測） */
+
     uint32_t sid = ++srv->next_session_id;
     memset(sess, 0, sizeof(*sess));
     sess->socket_fd     = client_fd;
     sess->eventfd       = evfd;
+    sess->pidfd         = watchdog_fd;   /* Phase 4：-1 = 不支援 */
+    sess->pid           = (pid_t)hello.consumer_pid;
     sess->session_id    = sid;
     sess->policy        = hello.policy;   /* Phase 3：記錄 backpressure policy */
     sess->refslot_count = 0;
@@ -255,8 +291,23 @@ static void handle_accepted_client(struct vfr_server *srv, int client_fd)
         return;
     }
 
-    VFR_LOGI("new consumer: fd=%d session_id=%u pid=%d policy=%u evfd=%d (total=%u)",
-             client_fd, sid, (int)hello.consumer_pid, hello.policy, evfd, srv->session_count);
+    /* Step 7（Phase 4）: 加入 pidfd 到 epoll（EPOLLIN = consumer process 死亡）*/
+    if (watchdog_fd >= 0) {
+        struct epoll_event evpid = {
+            .events  = EPOLLIN,
+            .data.fd = watchdog_fd,
+        };
+        if (epoll_ctl(srv->epoll_fd, EPOLL_CTL_ADD, watchdog_fd, &evpid) < 0) {
+            VFR_LOGW("epoll_ctl ADD pidfd=%d pid=%d: %s (watchdog disabled for this session)",
+                     watchdog_fd, (int)hello.consumer_pid, strerror(errno));
+            /* pidfd epoll 失敗不是致命錯誤：socket HUP 仍可偵測斷線 */
+            vfr_watchdog_close(&sess->pidfd);
+        }
+    }
+
+    VFR_LOGI("new consumer: fd=%d session_id=%u pid=%d policy=%u evfd=%d pidfd=%d (total=%u)",
+             client_fd, sid, (int)hello.consumer_pid, hello.policy, evfd, sess->pidfd,
+             srv->session_count);
 }
 
 /* ─── handle_release_msg ─────────────────────────────────────────────────── */
@@ -341,6 +392,7 @@ vfr_server_t *vfr_server_create(const char *stream_name, uint32_t slot_count)
     for (int i = 0; i < VFR_MAX_CONSUMERS; i++) {
         srv->sessions[i].socket_fd = -1;
         srv->sessions[i].eventfd   = -1;
+        srv->sessions[i].pidfd     = -1;  /* Phase 4 */
     }
 
     /* ── Platform + Pool ────────────────────────────────────────────────── */
@@ -446,13 +498,32 @@ int vfr_server_handle_events(vfr_server_t *srv, int timeout_ms)
                 handle_accepted_client(srv, cfd);
             }
         } else {
-            /* Client fd：release_msg 或斷線 */
+            /* Phase 4：先判斷是否為 pidfd 事件（consumer process 死亡）*/
+            consumer_session_t *pidfd_sess = find_session_by_pidfd(srv, fd);
+            if (pidfd_sess) {
+                VFR_LOGI("watchdog: consumer pid=%d died (session_id=%u), teardown",
+                         (int)pidfd_sess->pid, pidfd_sess->session_id);
+                teardown_session(srv, pidfd_sess);
+                continue;
+            }
+
+            /* Client fd：release_msg 或斷線
+             * 注意：若同一 epoll_wait 批次中 socket HUP 與 pidfd EPOLLIN 並排出現，
+             * socket HUP 先處理完 teardown（關閉所有 fd）後，後續批次項目的 fd 已失效。
+             * 因此先確認 fd 仍在 active session 中再路由，避免 EBADF 雜訊。 */
             if (events[i].events & (EPOLLHUP | EPOLLERR)) {
                 VFR_LOGI("client fd=%d HUP/ERR", fd);
                 consumer_session_t *sess = find_session_by_fd(srv, fd);
                 if (sess) teardown_session(srv, sess);
+                /* else: stale event（同批次 teardown 已處理），忽略 */
             } else if (events[i].events & EPOLLIN) {
-                handle_release_msg(srv, fd);
+                /* 確認 fd 仍屬於 active session 的 socket，避免處理已關閉的 pidfd */
+                consumer_session_t *sess = find_session_by_fd(srv, fd);
+                if (sess) {
+                    handle_release_msg(srv, fd);
+                } else {
+                    VFR_LOGD("EPOLLIN on fd=%d: not an active session socket, skip", fd);
+                }
             }
         }
     }
@@ -676,6 +747,21 @@ int vfr_server_produce(vfr_server_t *srv)
     }
 
     return 0;
+}
+
+/* ─── Phase 4：監控介面 ─────────────────────────────────────────────────── */
+
+uint32_t vfr_server_get_drop_count(const vfr_server_t *srv)
+{
+    if (!srv) return 0;
+    return atomic_load_explicit(&((vfr_server_t *)srv)->shm_hdr.drop_count,
+                                memory_order_relaxed);
+}
+
+uint32_t vfr_server_get_session_count(const vfr_server_t *srv)
+{
+    if (!srv) return 0;
+    return srv->session_count;
 }
 
 /* ─── vfr_server_destroy（原則五順序）──────────────────────────────────── */

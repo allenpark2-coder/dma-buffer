@@ -1,5 +1,5 @@
 # VFR — Video Frame Reader
-# Phase 1 + Phase 2 + Phase 3 Makefile
+# Phase 1 + Phase 2 + Phase 3 + Phase 4 Makefile
 
 CC      = gcc
 CFLAGS  = -Wall -Wextra -std=c11 -D_GNU_SOURCE
@@ -31,7 +31,8 @@ SRCS_IPC_CLIENT = \
     ipc/vfr_client.c
 
 SRCS_IPC_SERVER = \
-    ipc/vfr_server.c
+    ipc/vfr_server.c \
+    ipc/vfr_watchdog.c
 
 SRCS_TEST_SINGLE = \
     test/test_single_proc.c
@@ -45,10 +46,13 @@ SRCS_TEST_CONSUMER = \
 SRCS_TEST_MULTICAST = \
     test/test_multicast.c
 
-# ─── targets ───────────────────────────────────────────────────────────────────
-.PHONY: all clean valgrind asan check check2 check3
+SRCS_TEST_CRASH = \
+    test/test_crash_recovery.c
 
-all: test_single_proc test_ipc_producer test_ipc_consumer test_multicast
+# ─── targets ───────────────────────────────────────────────────────────────────
+.PHONY: all clean valgrind asan check check2 check3 check4
+
+all: test_single_proc test_ipc_producer test_ipc_consumer test_multicast test_crash_recovery
 
 # ── Phase 1 ────────────────────────────────────────────────────────────────────
 test_single_proc: $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_TEST_SINGLE)
@@ -66,6 +70,11 @@ test_ipc_consumer: $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(S
 # ── Phase 3 ────────────────────────────────────────────────────────────────────
 # test_multicast：單一 binary，--role producer|rtsp|recorder|motion
 test_multicast: $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_IPC_SERVER) $(SRCS_TEST_MULTICAST)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+
+# ── Phase 4 ────────────────────────────────────────────────────────────────────
+# test_crash_recovery：Consumer crash / watchdog recovery 驗證
+test_crash_recovery: $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_IPC_SERVER) $(SRCS_TEST_CRASH)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
 
 # ── Phase 1 驗證 ──────────────────────────────────────────────────────────────
@@ -155,8 +164,43 @@ asan3:
 	    $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_IPC_SERVER) $(SRCS_TEST_MULTICAST)
 	@echo "=== ASan build OK. Run: make check3 with asan binary for full validation ==="
 
+# ── Phase 4 驗證（fork-based self-test）────────────────────────────────────
+# check4：單一 binary 自測，啟動 server 後 fork crasher child，
+# 驗證 watchdog 觸發後 slot 回收、producer 繼續出幀
+check4: test_crash_recovery
+	@echo "=== Running Phase 4 Crash Recovery Test ==="
+	./test_crash_recovery --self-test
+	@RESULT=$$?; \
+	echo "=== Phase 4 Overall: $$([ $$RESULT -eq 0 ] && echo PASS || echo FAIL) ==="; \
+	exit $$RESULT
+
+# Phase 4 兩 binary 模式驗證（外部 kill -9）
+check4-ext: test_crash_recovery
+	@echo "=== Running Phase 4 External Kill Test ==="
+	@./test_crash_recovery --role producer --frames 120 &
+	@PROD_PID=$$!; \
+	sleep 0.3; \
+	VFR_MODE=client ./test_crash_recovery --role crasher --hold-ms 2000 & \
+	CRASHER_PID=$$!; \
+	sleep 0.4; \
+	echo "[check4] kill -9 crasher (pid=$$CRASHER_PID)"; \
+	kill -9 $$CRASHER_PID 2>/dev/null; \
+	wait $$PROD_PID; RESULT=$$?; \
+	echo "=== Phase 4 External: $$([ $$RESULT -eq 0 ] && echo PASS || echo FAIL) ==="; \
+	exit $$RESULT
+
+# ── ASan 驗收（Phase 4 checklist 3.4）──────────────────────────────────────
+asan4:
+	$(CC) $(CFLAGS) $(INCLUDES) \
+	    -fsanitize=address,undefined \
+	    -fno-omit-frame-pointer \
+	    -o test_crash_recovery_asan \
+	    $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_IPC_SERVER) $(SRCS_TEST_CRASH)
+	./test_crash_recovery_asan --self-test
+
 clean:
 	rm -f test_single_proc test_single_proc_asan
 	rm -f test_ipc_producer test_ipc_consumer
 	rm -f test_multicast test_multicast_asan
+	rm -f test_crash_recovery test_crash_recovery_asan
 	rm -f /tmp/frame_*.yuv
