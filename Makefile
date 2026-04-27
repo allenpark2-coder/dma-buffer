@@ -60,7 +60,7 @@ SRCS_TEST_METRICS = \
     test/test_metrics.c
 
 # ─── targets ───────────────────────────────────────────────────────────────────
-.PHONY: all clean valgrind asan check check2 check3 check4 check5 check5-serve asan5
+.PHONY: all clean valgrind asan check check2 check3 check4 check5 check5-serve asan5 check_r1
 
 all: test_single_proc test_ipc_producer test_ipc_consumer test_multicast test_crash_recovery test_metrics
 
@@ -273,12 +273,28 @@ asan5:
 	    $(SRCS_IPC_SERVER) $(SRCS_METRICS) $(SRCS_REGISTRY) $(SRCS_TEST_METRICS)
 	./test_metrics_asan
 
+# ── Phase R1 — Recorder Circular Buffer ─────────────────────────────────────
+test_rec_buf: rec/rec_buf.c test/test_rec_buf.c
+	$(CC) $(CFLAGS) $(INCLUDES) -Irec -o $@ $^
+
+test_rec_buf_asan: rec/rec_buf.c test/test_rec_buf.c
+	$(CC) $(CFLAGS) $(INCLUDES) -Irec \
+	    -fsanitize=address,undefined -fno-omit-frame-pointer \
+	    -o $@ $^
+	./$@
+
+check_r1: test_rec_buf
+	@echo "=== Running Phase R1 Tests ==="
+	./test_rec_buf
+	@echo "=== Phase R1: PASS ==="
+
 clean:
 	rm -f test_single_proc test_single_proc_asan
 	rm -f test_ipc_producer test_ipc_consumer
 	rm -f test_multicast test_multicast_asan
 	rm -f test_crash_recovery test_crash_recovery_asan
 	rm -f test_metrics test_metrics_asan
+	rm -f test_rec_buf test_rec_buf_asan
 	rm -f bridge_opencv.o test_opencv_bridge
 	rm -f bridge_gstreamer.o test_gstreamer_bridge
 	rm -f /tmp/frame_*.yuv
