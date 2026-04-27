@@ -2,6 +2,11 @@
 #include <string.h>
 #include <stdint.h>
 
+/* PAT section_length: counts from after section_length field to end of CRC.
+ * Fixed for single-program PAT: ts_id(2)+flags(1)+sec_no(1)+last_sec_no(1)
+ *                               + program_entry(4) + CRC(4) = 13 */
+#define PAT_SECTION_LEN  13
+
 static uint32_t crc32_mpeg(const uint8_t *data, int len)
 {
     uint32_t crc = 0xFFFFFFFFu;
@@ -28,8 +33,8 @@ int rec_ts_write_pat(uint8_t *buf, size_t buf_size, uint8_t *cc_pat)
 
     uint8_t *s = buf + 5;
     s[0] = 0x00;
-    s[1] = 0xB0 | 0x00;
-    s[2] = 13;
+    s[1] = 0xB0;                /* SSI=1, '0'=0, reserved=11, section_length[11:8]=0 */
+    s[2] = PAT_SECTION_LEN;
     s[3] = 0x00; s[4] = 0x01;
     s[5] = 0xC1;
     s[6] = 0x00;
@@ -37,7 +42,8 @@ int rec_ts_write_pat(uint8_t *buf, size_t buf_size, uint8_t *cc_pat)
     s[8]  = 0x00; s[9]  = 0x01;
     s[10] = 0xE0 | (REC_TS_PID_PMT >> 8);
     s[11] = REC_TS_PID_PMT & 0xFF;
-    uint32_t crc = crc32_mpeg(s, 12);
+    /* CRC32 covers table_id through last program entry (12 bytes = PAT_SECTION_LEN - 1 CRC field) */
+    uint32_t crc = crc32_mpeg(s, PAT_SECTION_LEN - 1);
     s[12] = (crc >> 24) & 0xFF;
     s[13] = (crc >> 16) & 0xFF;
     s[14] = (crc >>  8) & 0xFF;
