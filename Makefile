@@ -312,7 +312,7 @@ check_r2: test_rec_state
 	@echo "=== Phase R2: PASS ==="
 
 # ── Phase R3 — Async Writer + Segmenter ─────────────────────────────────────
-_test_rec_writer_iter: rec/rec_ts_mux.c test/test_rec_writer.c
+_test_rec_writer_iter: rec/rec_ts_mux.c rec/rec_segment.c test/test_rec_writer.c
 	$(CC) $(CFLAGS) $(INCLUDES) -Irec -o test_rec_writer $^
 
 clean:

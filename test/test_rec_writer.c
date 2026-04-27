@@ -4,7 +4,10 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include "rec_ts_mux.h"
+#include "rec_segment.h"
 
 static void assert_ts_header(const uint8_t *pkt, uint16_t pid,
                               bool pusi, uint8_t cc)
@@ -130,6 +133,58 @@ static void test_pes_cc(void)
     printf("PASS: test_pes_cc\n");
 }
 
+static void test_segment_opens_file(void)
+{
+    const char *dir = "/tmp/rec_test_seg";
+    mkdir(dir, 0755);
+    rec_segment_t *seg = rec_segment_open(dir, "cam0", REC_MODE_CONTINUOUS,
+                                          600, 2ULL*1024*1024*1024, 60);
+    assert(seg != NULL);
+    uint8_t pat[188]; uint8_t cc = 0;
+    rec_ts_write_pat(pat, sizeof(pat), &cc);
+    int r = rec_segment_write(seg, pat, 188, 33333333ull);
+    assert(r == 0);
+    assert(rec_segment_written_bytes(seg) == 188);
+    rec_segment_close(seg);
+    int found = system("ls /tmp/rec_test_seg/*.ts 2>/dev/null | grep -q .ts");
+    assert(found == 0);
+    system("rm -rf /tmp/rec_test_seg");
+    printf("PASS: test_segment_opens_file\n");
+}
+
+static void test_segment_size_limit(void)
+{
+    const char *dir = "/tmp/rec_test_seg2";
+    mkdir(dir, 0755);
+    rec_segment_t *seg = rec_segment_open(dir, "cam0", REC_MODE_CONTINUOUS,
+                                          600, 376, 0);
+    assert(seg != NULL);
+    uint8_t pkt[188]; memset(pkt, 0x47, 188);
+    int r1 = rec_segment_write(seg, pkt, 188, 0);
+    int r2 = rec_segment_write(seg, pkt, 188, 0);
+    assert(r1 == 0);
+    assert(r2 == 1);
+    rec_segment_close(seg);
+    system("rm -rf /tmp/rec_test_seg2");
+    printf("PASS: test_segment_size_limit\n");
+}
+
+static void test_segment_duration_limit(void)
+{
+    const char *dir = "/tmp/rec_test_seg3";
+    mkdir(dir, 0755);
+    rec_segment_t *seg = rec_segment_open(dir, "cam0", REC_MODE_EVENT,
+                                          1, UINT64_MAX, 0);
+    uint8_t pkt[188]; memset(pkt, 0x47, 188);
+    for (int i = 0; i < 30; i++)
+        rec_segment_write(seg, pkt, 188, 33333333ull);
+    int r = rec_segment_write(seg, pkt, 188, 33333333ull);
+    assert(r == 1);
+    rec_segment_close(seg);
+    system("rm -rf /tmp/rec_test_seg3");
+    printf("PASS: test_segment_duration_limit\n");
+}
+
 int main(void)
 {
     test_pat_structure();
@@ -137,6 +192,9 @@ int main(void)
     test_pmt_structure();
     test_pes_basic();
     test_pes_cc();
+    test_segment_opens_file();
+    test_segment_size_limit();
+    test_segment_duration_limit();
     printf("\nAll tests PASS\n");
     return 0;
 }
