@@ -65,9 +65,11 @@ static void test_pmt_structure(void)
     assert(buf[4] == 0x00);      /* pointer field */
     assert(buf[5] == 0x02);      /* table_id = PMT */
     assert(buf[6] & 0x80);       /* section_syntax_indicator */
-    assert(buf[18] == 0x1B);     /* H.264 stream type */
+    /* stream_type at s[12] = buf[17] */
+    assert(buf[17] == 0x1B);     /* H.264 stream type */
 
-    uint16_t epid = ((uint16_t)(buf[19] & 0x1F) << 8) | buf[20];
+    /* elementary PID at s[13..14] = buf[18..19] */
+    uint16_t epid = ((uint16_t)(buf[18] & 0x1F) << 8) | buf[19];
     assert(epid == REC_TS_PID_VIDEO);
 
     printf("PASS: test_pmt_structure\n");

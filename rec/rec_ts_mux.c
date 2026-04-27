@@ -7,6 +7,14 @@
  *                               + program_entry(4) + CRC(4) = 13 */
 #define PAT_SECTION_LEN  13
 
+/* PMT section_length = 18:
+ *   program_number(2)+flags(1)+sec_no(1)+last_sec_no(1) = 5
+ *   PCR_PID+reserved(2) + program_info_length+reserved(2) = 4
+ *   ES entry: stream_type(1)+E_PID+reserved(2)+ES_info_len+reserved(2) = 5
+ *   CRC(4) = 4
+ *   Total = 5+4+5+4 = 18 */
+#define PMT_SECTION_LEN  18
+
 static uint32_t crc32_mpeg(const uint8_t *data, int len)
 {
     uint32_t crc = 0xFFFFFFFFu;
@@ -67,18 +75,6 @@ int rec_ts_write_pmt(uint8_t *buf, size_t buf_size, uint32_t format, uint8_t *cc
     buf[4] = 0x00;
 
     uint8_t *s = buf + 5;
-    /*
-     * PMT section_length = 19:
-     *   program_number(2) + flags(1) + sec_no(1) + last_sec_no(1) = 5
-     *   PCR_PID(2) + program_info_len(2) + program_info(1) = 5
-     *   ES entry: stream_type(1) + E_PID(2) + ES_info_len(2) = 5
-     *   CRC(4) = 4
-     *   Total = 5+5+5+4 = 19
-     *
-     * One padding byte in program_info area ensures stream_type lands
-     * at buf[18] (s[13]) as required by the test vector.
-     */
-#define PMT_SECTION_LEN 19
     s[0] = 0x02;                /* table_id = PMT */
     s[1] = 0xB0;                /* SSI=1, '0'=0, reserved=11, len[11:8]=0 */
     s[2] = PMT_SECTION_LEN;
@@ -88,18 +84,17 @@ int rec_ts_write_pmt(uint8_t *buf, size_t buf_size, uint32_t format, uint8_t *cc
     s[7] = 0x00;                /* last_section_number */
     s[8]  = 0xE0 | (REC_TS_PID_VIDEO >> 8);  /* PCR_PID high */
     s[9]  = REC_TS_PID_VIDEO & 0xFF;          /* PCR_PID low */
-    s[10] = 0xF0; s[11] = 0x01;               /* program_info_length = 1 */
-    s[12] = 0xFF;                              /* 1-byte program info padding */
-    s[13] = stream_type;
-    s[14] = 0xE0 | (REC_TS_PID_VIDEO >> 8);  /* ES PID high */
-    s[15] = REC_TS_PID_VIDEO & 0xFF;          /* ES PID low */
-    s[16] = 0xF0; s[17] = 0x00;               /* ES_info_length = 0 */
-    /* CRC covers s[0..17] = 18 bytes (PMT_SECTION_LEN - 1) */
-    uint32_t crc = crc32_mpeg(s, PMT_SECTION_LEN - 1);
-    s[18] = (crc >> 24) & 0xFF;
-    s[19] = (crc >> 16) & 0xFF;
-    s[20] = (crc >>  8) & 0xFF;
-    s[21] =  crc        & 0xFF;
+    s[10] = 0xF0; s[11] = 0x00;               /* program_info_length = 0 */
+    s[12] = stream_type;                       /* stream_type at s[12] = buf[17] */
+    s[13] = 0xE0 | (REC_TS_PID_VIDEO >> 8);  /* ES PID high */
+    s[14] = REC_TS_PID_VIDEO & 0xFF;          /* ES PID low */
+    s[15] = 0xF0; s[16] = 0x00;               /* ES_info_length = 0 */
+    /* CRC covers s[0..PMT_SECTION_LEN-5] = s[0..13]... actually s[0..16] = 17 bytes */
+    uint32_t crc = crc32_mpeg(s, PMT_SECTION_LEN - 1);  /* 17 bytes */
+    s[17] = (crc >> 24) & 0xFF;
+    s[18] = (crc >> 16) & 0xFF;
+    s[19] = (crc >>  8) & 0xFF;
+    s[20] =  crc        & 0xFF;
     return 188;
 }
 
@@ -169,7 +164,7 @@ int rec_ts_write_pes(uint8_t *buf, size_t buf_size,
     uint8_t *pes = p + 4 + adapt_size;  /* = p + 12 */
     pes[0] = 0x00; pes[1] = 0x00; pes[2] = 0x01; pes[3] = 0xE0;
     pes[4] = 0x00; pes[5] = 0x00;  /* PES_packet_length = 0 (unbounded) */
-    pes[6] = 0x81;                  /* marker=10, data_alignment=1 */
+    pes[6] = 0x81;                  /* marker=10, original_or_copy=1, other flags=0 */
     pes[7] = 0x80;                  /* PTS_DTS_flags = 10 (PTS only) */
     pes[8] = 0x05;                  /* PES_header_data_length */
     encode_pts(pes + 9, ns_to_90khz(pts_ns), 0x02);
@@ -194,10 +189,12 @@ int rec_ts_write_pes(uint8_t *buf, size_t buf_size,
         if (chunk < 184) {
             uint32_t stuffing = 184 - chunk;
             p[3] = 0x30 | (*cc_video & 0x0F);
-            p[4] = stuffing - 1;
-            p[5] = 0x00;
-            if (stuffing > 2)
-                memset(p + 6, 0xFF, stuffing - 2);
+            p[4] = stuffing - 1;           /* adaptation_field_length */
+            if (stuffing >= 2) {
+                p[5] = 0x00;               /* flags byte (only valid when AFL >= 1) */
+                if (stuffing > 2)
+                    memset(p + 6, 0xFF, stuffing - 2);  /* stuffing bytes */
+            }
             memcpy(p + 4 + stuffing, src, chunk);
         } else {
             p[3] = 0x10 | (*cc_video & 0x0F);
