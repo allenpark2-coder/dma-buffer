@@ -148,7 +148,7 @@ static void test_segment_opens_file(void)
     rec_segment_close(seg);
     int found = system("ls /tmp/rec_test_seg/*.ts 2>/dev/null | grep -q .ts");
     assert(found == 0);
-    system("rm -rf /tmp/rec_test_seg");
+    { int _r = system("rm -rf /tmp/rec_test_seg"); (void)_r; }
     printf("PASS: test_segment_opens_file\n");
 }
 
@@ -165,7 +165,7 @@ static void test_segment_size_limit(void)
     assert(r1 == 0);
     assert(r2 == 1);
     rec_segment_close(seg);
-    system("rm -rf /tmp/rec_test_seg2");
+    { int _r = system("rm -rf /tmp/rec_test_seg2"); (void)_r; }
     printf("PASS: test_segment_size_limit\n");
 }
 
@@ -181,7 +181,7 @@ static void test_segment_duration_limit(void)
     int r = rec_segment_write(seg, pkt, 188, 33333333ull);
     assert(r == 1);
     rec_segment_close(seg);
-    system("rm -rf /tmp/rec_test_seg3");
+    { int _r = system("rm -rf /tmp/rec_test_seg3"); (void)_r; }
     printf("PASS: test_segment_duration_limit\n");
 }
 
