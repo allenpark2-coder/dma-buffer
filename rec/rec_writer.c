@@ -58,12 +58,19 @@ int rec_writer_get_eventfd(const rec_writer_t *w)
 int rec_writer_enqueue(rec_writer_t *w, rec_write_item_t item)
 {
     if (item.is_shutdown_sentinel) {
-        /* Always enqueue sentinel — reserve last slot */
-        uint32_t tail = atomic_load_explicit(&w->write_queue.tail,
-                                             memory_order_relaxed);
+        /* Spin until a slot is free, then enqueue the sentinel.
+         * The writer always has a pending eventfd signal when the queue is
+         * full (the flood signals at least once), so this spin exits quickly. */
+        uint32_t tail, next;
+        do {
+            tail = atomic_load_explicit(&w->write_queue.tail,
+                                        memory_order_relaxed);
+            next = (tail + 1) % REC_WRITE_QUEUE_DEPTH;
+        } while (next == atomic_load_explicit(&w->write_queue.head,
+                                              memory_order_acquire));
+
         w->write_queue.items[tail] = item;
-        atomic_store_explicit(&w->write_queue.tail,
-                              (tail + 1) % REC_WRITE_QUEUE_DEPTH,
+        atomic_store_explicit(&w->write_queue.tail, next,
                               memory_order_release);
         uint64_t one = 1;
         ssize_t _wr = write(w->eventfd, &one, sizeof(one));
@@ -72,19 +79,31 @@ int rec_writer_enqueue(rec_writer_t *w, rec_write_item_t item)
     }
 
     uint32_t tail = atomic_load_explicit(&w->write_queue.tail, memory_order_relaxed);
+    uint32_t head = atomic_load_explicit(&w->write_queue.head, memory_order_acquire);
     uint32_t next = (tail + 1) % REC_WRITE_QUEUE_DEPTH;
 
-    if (next == atomic_load_explicit(&w->write_queue.head, memory_order_acquire)) {
+    if (next == head) {
         /* Queue full — overflow handling */
         atomic_fetch_add_explicit(&w->dropped_frames, 1, memory_order_relaxed);
         return REC_ERR_QUEUE_FULL;
     }
 
     w->write_queue.items[tail] = item;
-    atomic_store_explicit(&w->write_queue.tail, next, memory_order_release);
-    uint64_t one = 1;
-    ssize_t _wr = write(w->eventfd, &one, sizeof(one));
-    (void)_wr;
+    /* seq_cst store so the post-store head reload below is ordered correctly */
+    atomic_store_explicit(&w->write_queue.tail, next, memory_order_seq_cst);
+
+    /* Signal the writer only when the queue was empty (empty→non-empty edge).
+     * Reload head with seq_cst after the tail store so we cannot miss a
+     * wakeup: if the writer drained to empty and is about to block, either
+     * it will see our new tail (and skip the eventfd read) or it will block
+     * and we will see head == tail here and send the signal. */
+    uint32_t head_after = atomic_load_explicit(&w->write_queue.head,
+                                               memory_order_seq_cst);
+    if (head_after == tail) {
+        uint64_t one = 1;
+        ssize_t _wr = write(w->eventfd, &one, sizeof(one));
+        (void)_wr;
+    }
     return REC_OK;
 }
 

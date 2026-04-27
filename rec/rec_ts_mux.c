@@ -171,7 +171,7 @@ int rec_ts_write_pes(uint8_t *buf, size_t buf_size,
 
     uint8_t *data_start = pes + pes_hdr_size;  /* = p + 26 */
     uint32_t copy1 = (payload_size < first_cap) ? payload_size : first_cap;
-    memcpy(data_start, src, copy1);
+    if (copy1 > 0) memcpy(data_start, src, copy1);
     src += copy1;
     if (copy1 < first_cap)
         memset(data_start + copy1, 0xFF, first_cap - copy1);
