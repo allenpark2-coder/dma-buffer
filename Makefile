@@ -70,18 +70,12 @@ SRCS_REC_STATE = \
     rec/rec_trigger.c \
     rec/rec_state.c
 
-SRCS_REC_WRITER = \
-    rec/rec_buf.c \
-    rec/rec_segment.c \
-    rec/rec_writer.c
-
 # ─── targets ───────────────────────────────────────────────────────────────────
 .PHONY: all clean valgrind asan check check2 check3 check4 check5 check5-serve asan5 \
         test_rec_buf check_r1 asan_r1 \
-        test_rec_state check_r2 asan_r2 \
-        test_rec_writer check_r3 asan_r3
+        test_rec_state check_r2 asan_r2
 
-all: test_single_proc test_ipc_producer test_ipc_consumer test_multicast test_crash_recovery test_metrics test_rec_buf test_rec_state test_rec_writer
+all: test_single_proc test_ipc_producer test_ipc_consumer test_multicast test_crash_recovery test_metrics test_rec_buf test_rec_state
 
 # ── Phase 1 ────────────────────────────────────────────────────────────────────
 test_single_proc: $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_TEST_SINGLE)
@@ -299,9 +293,6 @@ test_rec_buf: $(SRCS_REC_BUF) test/test_rec_buf.c
 test_rec_state: $(SRCS_REC_STATE) test/test_rec_state.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
 
-test_rec_writer: $(SRCS_REC_WRITER) test/test_rec_writer.c
-	$(CC) $(CFLAGS) $(INCLUDES) -pthread -o $@ $^
-
 # ── Phase R1 驗收 ─────────────────────────────────────────────────────────────
 check_r1: test_rec_buf
 	@echo "=== Running Phase R1 rec_buf Tests ==="
@@ -334,22 +325,6 @@ asan_r2:
 	    $(SRCS_REC_STATE) test/test_rec_state.c
 	./test_rec_state_asan
 
-check_r3: test_rec_writer
-	@echo "=== Running Phase R3 rec_writer Tests ==="
-	./test_rec_writer
-	@RESULT=$$?; \
-	echo "=== Phase R3 Overall: $$([ $$RESULT -eq 0 ] && echo PASS || echo FAIL) ==="; \
-	exit $$RESULT
-
-asan_r3:
-	$(CC) $(CFLAGS) $(INCLUDES) \
-	    -fsanitize=address,undefined \
-	    -fno-omit-frame-pointer \
-	    -pthread \
-	    -o test_rec_writer_asan \
-	    $(SRCS_REC_WRITER) test/test_rec_writer.c
-	./test_rec_writer_asan
-
 clean:
 	rm -f test_single_proc test_single_proc_asan
 	rm -f test_ipc_producer test_ipc_consumer
@@ -360,5 +335,4 @@ clean:
 	rm -f bridge_gstreamer.o test_gstreamer_bridge
 	rm -f test_rec_buf test_rec_buf_asan
 	rm -f test_rec_state test_rec_state_asan
-	rm -f test_rec_writer test_rec_writer_asan
 	rm -f /tmp/frame_*.yuv
