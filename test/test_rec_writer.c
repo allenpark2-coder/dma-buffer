@@ -8,6 +8,8 @@
 #include <sys/stat.h>
 #include "rec_ts_mux.h"
 #include "rec_segment.h"
+#include <pthread.h>
+#include "rec_writer.h"
 
 static void assert_ts_header(const uint8_t *pkt, uint16_t pid,
                               bool pusi, uint8_t cc)
@@ -185,6 +187,39 @@ static void test_segment_duration_limit(void)
     printf("PASS: test_segment_duration_limit\n");
 }
 
+static void test_writer_create_destroy(void)
+{
+    rec_buf_t *ring = rec_buf_create(1 * 1024 * 1024);
+    assert(ring != NULL);
+
+    rec_codec_config_t codec_cfg = {0};
+    atomic_init(&codec_cfg.active_slot, 0);
+    atomic_init(&codec_cfg.version, 0);
+
+    rec_writer_config_t cfg = {
+        .segment_duration_sec = 600,
+        .segment_size_max     = 2ULL * 1024 * 1024 * 1024,
+        .flush_interval_sec   = 60,
+        .mode                 = REC_MODE_CONTINUOUS,
+    };
+    strncpy(cfg.output_dir,  "/tmp/rec_test_writer", sizeof(cfg.output_dir) - 1);
+    strncpy(cfg.stream_name, "cam0",                 sizeof(cfg.stream_name) - 1);
+    { int _r = mkdir("/tmp/rec_test_writer", 0755); (void)_r; }
+
+    rec_writer_t *w = rec_writer_create(ring, &codec_cfg, &cfg);
+    assert(w != NULL);
+
+    int efd = rec_writer_get_eventfd(w);
+    assert(efd >= 0);
+
+    rec_writer_destroy(&w);
+    assert(w == NULL);
+
+    rec_buf_destroy(&ring);
+    { int _r = system("rm -rf /tmp/rec_test_writer"); (void)_r; }
+    printf("PASS: test_writer_create_destroy\n");
+}
+
 int main(void)
 {
     test_pat_structure();
@@ -195,6 +230,7 @@ int main(void)
     test_segment_opens_file();
     test_segment_size_limit();
     test_segment_duration_limit();
+    test_writer_create_destroy();
     printf("\nAll tests PASS\n");
     return 0;
 }
