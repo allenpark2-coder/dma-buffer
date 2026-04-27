@@ -60,7 +60,7 @@ SRCS_TEST_METRICS = \
     test/test_metrics.c
 
 # ─── targets ───────────────────────────────────────────────────────────────────
-.PHONY: all clean valgrind asan check check2 check3 check4 check5 check5-serve asan5 check_r1
+.PHONY: all clean valgrind asan check check2 check3 check4 check5 check5-serve asan5 check_r1 check_r2
 
 all: test_single_proc test_ipc_producer test_ipc_consumer test_multicast test_crash_recovery test_metrics
 
@@ -288,6 +288,29 @@ check_r1: test_rec_buf
 	./test_rec_buf
 	@echo "=== Phase R1: PASS ==="
 
+# ── Phase R2 — State Machine ─────────────────────────────────────────────────
+SRCS_REC_STATE = \
+	rec/rec_debounce.c \
+	rec/rec_buf.c \
+	rec/rec_state.c
+
+SRCS_TEST_REC_STATE = \
+	test/test_rec_state.c
+
+test_rec_state: $(SRCS_REC_STATE) $(SRCS_TEST_REC_STATE)
+	$(CC) $(CFLAGS) $(INCLUDES) -Irec -o $@ $^
+
+test_rec_state_asan: $(SRCS_REC_STATE) $(SRCS_TEST_REC_STATE)
+	$(CC) $(CFLAGS) $(INCLUDES) -Irec \
+	    -fsanitize=address,undefined -fno-omit-frame-pointer \
+	    -o $@ $^
+	./$@
+
+check_r2: test_rec_state
+	@echo "=== Running Phase R2 Tests ==="
+	./test_rec_state
+	@echo "=== Phase R2: PASS ==="
+
 clean:
 	rm -f test_single_proc test_single_proc_asan
 	rm -f test_ipc_producer test_ipc_consumer
@@ -295,6 +318,7 @@ clean:
 	rm -f test_crash_recovery test_crash_recovery_asan
 	rm -f test_metrics test_metrics_asan
 	rm -f test_rec_buf test_rec_buf_asan
+	rm -f test_rec_state test_rec_state_asan
 	rm -f bridge_opencv.o test_opencv_bridge
 	rm -f bridge_gstreamer.o test_gstreamer_bridge
 	rm -f /tmp/frame_*.yuv
