@@ -8,7 +8,6 @@
 
 typedef struct {
     uint64_t last_start_ns;   /* timestamp of last accepted START (0 = never) */
-    uint64_t last_stop_ns;    /* timestamp of last accepted STOP  (0 = never) */
     uint32_t debounce_ms;     /* filter window in milliseconds */
 } rec_debounce_t;
 
@@ -26,7 +25,7 @@ void rec_debounce_init(rec_debounce_t *d, uint32_t debounce_ms);
  * STOP  rule: filtered if (ts_ns - last_start_ns) < debounce_ns
  *             (prevents glitch STOP that arrives right after a START).
  *
- * On pass, updates last_start_ns or last_stop_ns.
+ * On pass, updates last_start_ns (START path).
  */
 bool rec_debounce_filter(rec_debounce_t *d, rec_trigger_type_t type,
                          uint64_t ts_ns);

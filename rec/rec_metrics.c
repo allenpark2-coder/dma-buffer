@@ -152,6 +152,14 @@ int rec_metrics_serve_one(rec_metrics_t *m)
     int client = accept4(m->listen_fd, NULL, NULL, SOCK_CLOEXEC);
     if (client < 0) return -1;   /* EAGAIN or error */
 
+    /* Drain the HTTP request so the kernel can send a FIN (not RST) when we
+     * close.  A client that sends a large request (pipelining / big headers)
+     * would fill the recv buffer; close() on a non-empty buffer sends RST,
+     * discarding our response.  MSG_DONTWAIT prevents stalling the event loop. */
+    char req_buf[512];
+    while (recv(client, req_buf, sizeof(req_buf), MSG_DONTWAIT) > 0)
+        ;  /* drain until EAGAIN or error */
+
     char body[4096];
     int body_len = rec_metrics_format(m, body, sizeof(body));
     if (body_len < 0) {

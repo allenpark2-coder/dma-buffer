@@ -56,4 +56,10 @@ typedef struct {
 const vfr_platform_ops_t *vfr_get_amba_ops(void);   /* amba_adapter.c */
 const vfr_platform_ops_t *vfr_get_mock_ops(void);   /* mock_adapter.c / amba_adapter.c mock mode */
 
+/*
+ * vfr_select_platform(): 讀取 VFR_PLATFORM 環境變數並回傳對應 ops。
+ * 實作於 core/vfr_ctx.c；vfr_server.c 共用此函式避免重複邏輯。
+ */
+const vfr_platform_ops_t *vfr_select_platform(void);
+
 #endif /* VFR_PLATFORM_ADAPTER_H */

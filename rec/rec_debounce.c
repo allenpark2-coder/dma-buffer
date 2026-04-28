@@ -24,7 +24,6 @@ bool rec_debounce_filter(rec_debounce_t *d, rec_trigger_type_t type,
         if (d->last_start_ns != 0 &&
             ts_ns - d->last_start_ns < window_ns)
             return false;
-        d->last_stop_ns = ts_ns;
         return true;
     }
 }

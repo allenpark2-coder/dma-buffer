@@ -61,7 +61,7 @@ int vfr_sync_drain(int fd)
         VFR_LOGE("eventfd read(fd=%d) failed: %s", fd, strerror(errno));
         return -1;
     }
-    return (int)val;  /* EFD_SEMAPHORE 下始終為 1 */
+    return (val > 0) ? 1 : 0;  /* normalise: non-semaphore val can exceed INT_MAX */
 }
 
 /* ─── vfr_sync_wait ──────────────────────────────────────────────────────── */

@@ -360,7 +360,12 @@ void vfr_pool_server_release(vfr_pool_t *pool, uint32_t slot_id, uint64_t seq_nu
         return;
     }
 
-    /* tombstone check */
+    /* tombstone check — defensive guard for the standalone put_slot path.
+     * In IPC mode vfr_pool_force_release() intentionally does NOT set tombstone
+     * (the server removes the slot from refslot[] first, so handle_release_msg
+     * will never call server_release for the same slot again).  This check
+     * therefore never fires in IPC operation but is kept to protect future
+     * standalone callers that might set tombstone via a different code path. */
     if (atomic_load_explicit(&slot->tombstone, memory_order_acquire)) {
         VFR_LOGD("server_release slot[%u]: tombstone set, skip", slot_id);
         return;

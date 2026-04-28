@@ -52,7 +52,9 @@ typedef enum {
 /* ─── 狀態機狀態 ─────────────────────────────────────────────────── */
 typedef enum {
     REC_STATE_IDLE          = 0,
-    REC_STATE_EXTRACT_PRE   = 1,
+    REC_STATE_EXTRACT_PRE   = 1,  /* reserved: state machine never transitions here
+                                   * (pre-roll extraction is synchronous in IDLE).
+                                   * Kept for Prometheus gauge compatibility. */
     REC_STATE_WAIT_KEYFRAME = 2,
     REC_STATE_IN_EVENT      = 3,
     REC_STATE_POST_WAIT     = 4,

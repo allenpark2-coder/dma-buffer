@@ -1,6 +1,7 @@
 /* rec/rec_state.c — Recorder 5-state machine */
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
 #include "rec_state.h"
 
 static const char *state_name(rec_state_t s)
@@ -94,7 +95,9 @@ void rec_state_on_timer_tick(rec_state_ctx_t *ctx, uint64_t expirations)
     if (ctx->state != REC_STATE_POST_WAIT)
         return;
 
-    ctx->post_remaining_sec -= (int)expirations;
+    /* Clamp before cast: a suspended system could accumulate > INT_MAX ticks. */
+    uint64_t delta = (expirations > (uint64_t)INT_MAX) ? (uint64_t)INT_MAX : expirations;
+    ctx->post_remaining_sec -= (int)delta;
     if (ctx->post_remaining_sec <= 0 && !ctx->pending_trigger)
         do_transition(ctx, REC_STATE_IDLE);
 }

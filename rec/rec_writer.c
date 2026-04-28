@@ -178,6 +178,12 @@ static void *writer_thread(void *arg)
 
         /* ── [A] drain pre_extract_queue (priority) ──────────────── */
         if (w->ring) {
+            /* Snapshot the generation we are about to drain BEFORE the
+             * loop.  We must only clear the protect window if we still
+             * own this gen — a concurrent extract_from_keyframe may
+             * publish a newer gen while we drain. */
+            uint32_t drained_gen = atomic_load_explicit(
+                &w->ring->protected_gen, memory_order_acquire);
             uint32_t abort_snapshot = atomic_load_explicit(
                 &w->ring->aborted_pre_gen, memory_order_acquire);
 
@@ -211,16 +217,20 @@ static void *writer_thread(void *arg)
                 free(tmp);
             }
 
-            /* Clear protect window after draining */
-            uint32_t own_gen = atomic_load_explicit(&w->ring->protected_gen,
-                                                    memory_order_acquire);
-            if (own_gen != 0 && own_gen != REC_PRE_GEN_NONE) {
-                atomic_store_explicit(&w->ring->protected_read_size, 0,
-                                      memory_order_release);
-                atomic_store_explicit(&w->ring->protected_read_offset,
-                                      REC_PROTECT_NONE, memory_order_release);
-                atomic_store_explicit(&w->ring->protected_gen,
-                                      REC_PRE_GEN_NONE, memory_order_release);
+            /* Clear protect window only if we still own this generation.
+             * If extract_from_keyframe published a new gen concurrently,
+             * cur_gen != drained_gen and we leave the new window intact. */
+            if (drained_gen != REC_PRE_GEN_NONE) {
+                uint32_t cur_gen = atomic_load_explicit(&w->ring->protected_gen,
+                                                        memory_order_acquire);
+                if (cur_gen == drained_gen) {
+                    atomic_store_explicit(&w->ring->protected_read_size, 0,
+                                          memory_order_release);
+                    atomic_store_explicit(&w->ring->protected_read_offset,
+                                          REC_PROTECT_NONE, memory_order_release);
+                    atomic_store_explicit(&w->ring->protected_gen,
+                                          REC_PRE_GEN_NONE, memory_order_release);
+                }
             }
         }
 

@@ -36,8 +36,8 @@ struct vfr_ctx {
     vfr_client_state_t client;
 };
 
-/* ─── 平台選擇（standalone mode 用）──────────────────────────────────────── */
-static const vfr_platform_ops_t *select_platform(void)
+/* ─── 平台選擇（shared，vfr_server.c 也呼叫此函式）─────────────────────── */
+const vfr_platform_ops_t *vfr_select_platform(void)
 {
     const char *env = getenv("VFR_PLATFORM");
     if (!env || strcmp(env, "mock") == 0) {
@@ -117,7 +117,7 @@ vfr_ctx_t *vfr_open(const char *stream_name, uint32_t slot_count)
         clock_gettime(CLOCK_REALTIME, &ts);
         ctx->shm_hdr.producer_boot_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 
-        const vfr_platform_ops_t *ops = select_platform();
+        const vfr_platform_ops_t *ops = vfr_select_platform();
         ctx->pool = vfr_pool_create(ops, slot_count, &ctx->shm_hdr);
         if (!ctx->pool) {
             VFR_LOGE("vfr_pool_create failed");

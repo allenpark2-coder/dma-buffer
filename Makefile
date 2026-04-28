@@ -62,7 +62,8 @@ SRCS_TEST_METRICS = \
 # ─── targets ───────────────────────────────────────────────────────────────────
 .PHONY: all clean valgrind asan check check2 check3 check4 check5 check5-serve asan5 check_r1 check_r2 check_r3 check_r3_ffprobe check_r4
 
-all: test_single_proc test_ipc_producer test_ipc_consumer test_multicast test_crash_recovery test_metrics
+all: test_single_proc test_ipc_producer test_ipc_consumer test_multicast test_crash_recovery test_metrics \
+     test_rec_buf test_rec_state test_rec_writer test_rec_full
 
 # ── Phase 1 ────────────────────────────────────────────────────────────────────
 test_single_proc: $(SRCS_CORE) $(SRCS_SYNC) $(SRCS_MOCK) $(SRCS_IPC_CLIENT) $(SRCS_TEST_SINGLE)

@@ -97,5 +97,12 @@ void rec_trigger_handle_accept(rec_trigger_t *t)
     if (n != (ssize_t)sizeof(msg) || msg.magic != VFR_EVENT_MAGIC)
         return;
 
+    /* Reject unknown event types: the else-branch in rec_state_on_trigger
+     * treats anything that is not START as a STOP, so a malformed or
+     * crafted packet from another local process could inject a spurious STOP. */
+    if (msg.event_type != (uint32_t)REC_TRIGGER_START &&
+        msg.event_type != (uint32_t)REC_TRIGGER_STOP)
+        return;
+
     t->on_trigger(t->ud, (rec_trigger_type_t)msg.event_type, msg.timestamp_ns);
 }

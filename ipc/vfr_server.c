@@ -396,15 +396,7 @@ vfr_server_t *vfr_server_create(const char *stream_name, uint32_t slot_count)
     }
 
     /* ── Platform + Pool ────────────────────────────────────────────────── */
-    const vfr_platform_ops_t *ops;
-    {
-        const char *env = getenv("VFR_PLATFORM");
-        if (!env || strcmp(env, "mock") == 0) ops = vfr_get_mock_ops();
-#ifdef HAVE_IAV_IOCTL_H
-        else if (strcmp(env, "amba") == 0) ops = vfr_get_amba_ops();
-#endif
-        else { VFR_LOGW("unknown VFR_PLATFORM='%s', using mock", env); ops = vfr_get_mock_ops(); }
-    }
+    const vfr_platform_ops_t *ops = vfr_select_platform();   /* shared with vfr_ctx.c */
 
     srv->shm_hdr.magic      = VFR_SHM_MAGIC;
     srv->shm_hdr.slot_count = (slot_count == 0) ? VFR_DEFAULT_SLOTS : slot_count;
@@ -487,7 +479,10 @@ int vfr_server_handle_events(vfr_server_t *srv, int timeout_ms)
         int fd = events[i].data.fd;
 
         if (fd == srv->listen_fd) {
-            /* 新連線（SOCK_NONBLOCK，需迴圈 accept）*/
+            /* 新連線（SOCK_NONBLOCK，需迴圈 accept）
+             * NOTE: plain accept() is intentional — the accepted cfd is used
+             * with recv(MSG_WAITALL) in handle_accepted_client() which requires
+             * blocking mode.  Do NOT change to accept4(..., SOCK_NONBLOCK). */
             for (;;) {
                 int cfd = accept(srv->listen_fd, NULL, NULL);
                 if (cfd < 0) {
@@ -538,7 +533,11 @@ static void force_release_slot(struct vfr_server *srv, consumer_session_t *sess,
     bool found = false;
     for (uint32_t i = 0; i < sess->refslot_count; i++) {
         if (sess->refslot[i] == slot_id) {
-            sess->refslot[i] = sess->refslot[--sess->refslot_count];
+            /* shift-remove: preserve insertion order so refslot[0] is always
+             * the chronologically oldest slot (required by DROP_OLDEST). */
+            memmove(&sess->refslot[i], &sess->refslot[i + 1],
+                    (sess->refslot_count - i - 1) * sizeof(sess->refslot[0]));
+            sess->refslot_count--;
             found = true;
             break;
         }

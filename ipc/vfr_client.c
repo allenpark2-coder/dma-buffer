@@ -109,14 +109,22 @@ int vfr_client_connect(const char *stream_name, vfr_client_state_t *out_state,
     }
 
     /* ── Step 2: 接收 vfr_handshake_t（或 vfr_error_response_t）────────── */
+    /* SOCK_SEQPACKET preserves message boundaries: one recv() returns exactly
+     * the bytes from one send().  Version-mismatch → server sends the smaller
+     * vfr_error_response_t (8 bytes) then closes; success → 16-byte handshake.
+     * Using recv_all() here would block waiting for bytes that will never arrive
+     * (server already closed the connection after the 8-byte error response).
+     * Dispatch on received size instead. */
     vfr_handshake_t shake;
-    if (recv_all(sock, &shake, sizeof(shake)) < 0) {
-        VFR_LOGE("recv handshake failed: %s", strerror(errno));
+    memset(&shake, 0, sizeof(shake));
+    ssize_t n_shake = recv(sock, &shake, sizeof(shake), 0);
+    if (n_shake <= 0) {
+        VFR_LOGE("recv handshake failed: %s",
+                 n_shake == 0 ? "server closed connection" : strerror(errno));
         close(sock);
         return -1;
     }
 
-    /* 先檢查 magic；若不符可能是 error_response */
     if (shake.magic != VFR_SHM_MAGIC) {
         VFR_LOGE("handshake magic mismatch: got 0x%08x expect 0x%08x",
                  shake.magic, VFR_SHM_MAGIC);
@@ -124,19 +132,24 @@ int vfr_client_connect(const char *stream_name, vfr_client_state_t *out_state,
         return -1;
     }
 
-    /* error_response 的 layout：magic(4) + error(4)
-     * handshake 的 layout：magic(4) + proto_version(2) + header_size(2) + session_id(4) + pad(4)
-     * 用 proto_version == 0 判斷是否為 error_response（error_response 的對應欄位 = error code）*/
-    if (shake.proto_version == 0) {
-        /* 這其實是 vfr_error_response_t 的第二個 uint32_t（error code）*/
+    /* Short message → server rejected with vfr_error_response_t */
+    if (n_shake == (ssize_t)sizeof(vfr_error_response_t)) {
         vfr_error_response_t *err = (vfr_error_response_t *)&shake;
-        VFR_LOGE("proto_version mismatch: server error code %u", err->error);
+        VFR_LOGE("server rejected connection: proto_version mismatch (error %u)",
+                 err->error);
+        close(sock);
+        return -1;
+    }
+
+    if (n_shake < (ssize_t)sizeof(shake)) {
+        VFR_LOGE("handshake truncated: got %zd expect %zu", n_shake, sizeof(shake));
         close(sock);
         return -1;
     }
 
     if (shake.proto_version != VFR_PROTO_VERSION) {
-        VFR_LOGE("proto_version mismatch: got %u, expect %u", shake.proto_version, VFR_PROTO_VERSION);
+        VFR_LOGE("proto_version mismatch: got %u, expect %u",
+                 shake.proto_version, VFR_PROTO_VERSION);
         close(sock);
         return -1;
     }

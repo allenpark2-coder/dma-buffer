@@ -405,12 +405,19 @@ static void test_writer_overflow_drops(void)
     };
     rec_writer_enqueue(w, idr);
 
-    /* Immediately flood with NULL items while writer is busy with file I/O */
+    /* Flood with real 1-byte items while writer is busy with file I/O.
+     * Each successfully-enqueued item owns its allocation (writer frees it).
+     * Items that are dropped (queue full) are freed immediately here. */
     int dropped = 0;
     for (int i = 0; i < REC_WRITE_QUEUE_DEPTH * 4; i++) {
-        rec_write_item_t item = {.data = NULL, .size = 0, .is_keyframe = false};
-        if (rec_writer_enqueue(w, item) != REC_OK)
+        uint8_t *data = malloc(1);
+        assert(data);
+        *data = 0xAB;
+        rec_write_item_t item = {.data = data, .size = 1, .is_keyframe = false};
+        if (rec_writer_enqueue(w, item) != REC_OK) {
+            free(data);
             dropped++;
+        }
     }
     assert(dropped > 0);
 

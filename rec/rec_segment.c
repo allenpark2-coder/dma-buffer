@@ -5,6 +5,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <stdatomic.h>
 
 struct rec_segment {
     int      fd;
@@ -15,6 +17,10 @@ struct rec_segment {
     uint64_t max_size_bytes;
     uint32_t flush_interval_sec;
 };
+
+/* Monotonic counter: guarantees unique filenames even when two segments are
+ * opened within the same wall-clock second (fast rotation, test suites). */
+static _Atomic uint32_t seg_seq_counter = 0;
 
 rec_segment_t *rec_segment_open(const char *output_dir,
                                 const char *stream_name,
@@ -30,13 +36,15 @@ rec_segment_t *rec_segment_open(const char *output_dir,
     struct tm tm;
     localtime_r(&now, &tm);
     const char *mode_str = (mode == REC_MODE_EVENT) ? "event" : "cont";
+    uint32_t seq = atomic_fetch_add_explicit(&seg_seq_counter, 1u,
+                                             memory_order_relaxed);
     char path[512];
     snprintf(path, sizeof(path),
-             "%s/%s_%04d%02d%02d_%02d%02d%02d_%s.ts",
+             "%s/%s_%04d%02d%02d_%02d%02d%02d_%05u_%s.ts",
              output_dir, stream_name,
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
              tm.tm_hour, tm.tm_min, tm.tm_sec,
-             mode_str);
+             seq, mode_str);
 
     seg->fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (seg->fd < 0) { free(seg); return NULL; }
@@ -51,12 +59,16 @@ int rec_segment_write(rec_segment_t *seg,
                       const uint8_t *ts_buf, size_t size,
                       uint64_t duration_ns)
 {
-    /* Loop to handle short writes (e.g. ENOSPC / interrupted write on flash). */
+    /* Loop to handle short writes (ENOSPC / flash) and EINTR from RT signals. */
     size_t remaining = size;
     const uint8_t *ptr = ts_buf;
     while (remaining > 0) {
         ssize_t written = write(seg->fd, ptr, remaining);
-        if (written <= 0) return -1;   /* error or unexpected EOF */
+        if (written < 0) {
+            if (errno == EINTR) continue;   /* signal interrupted — retry */
+            return -1;
+        }
+        if (written == 0) return -1;        /* unexpected: full filesystem */
         ptr       += (size_t)written;
         remaining -= (size_t)written;
     }
