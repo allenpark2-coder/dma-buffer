@@ -81,4 +81,20 @@ typedef struct {
     uint64_t seq_num;     /* frame seq_num，防止過期回收（見 POOL_DESIGN.md §六）*/
 } vfr_release_msg_t;
 
+/* ─── AI Process → Recorder：事件觸發訊息（Phase R2+）────────────────────
+ * AI process 發送此訊息到 Recorder 的 Unix abstract socket:
+ *   \0/vfr/event/<stream_name>
+ * 連線後發送一次即關閉（無長連線）。
+ */
+#define VFR_EVENT_MAGIC  0x45564E54u   /* "EVNT" */
+
+typedef struct {
+    uint32_t magic;                          /* VFR_EVENT_MAGIC */
+    uint32_t event_type;                     /* rec_trigger_type_t */
+    uint64_t timestamp_ns;                   /* CLOCK_MONOTONIC */
+    float    confidence;                     /* 0.0 ~ 1.0 */
+    char     stream_name[VFR_SOCKET_NAME_MAX];
+    char     label[32];
+} vfr_event_msg_t;
+
 #endif /* VFR_IPC_TYPES_H */
