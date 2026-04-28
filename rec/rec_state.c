@@ -65,7 +65,7 @@ void rec_state_on_trigger(rec_state_ctx_t *ctx, rec_trigger_type_t type,
             break;
         }
         case REC_STATE_POST_WAIT:
-            ctx->pending_trigger    = true;
+            ctx->pending_trigger    = false;  /* leave POST_WAIT; timer must be able to expire */
             ctx->post_remaining_sec = REC_POST_RECORD_SEC_DEFAULT;
             do_transition(ctx, REC_STATE_IN_EVENT);
             break;

@@ -51,9 +51,16 @@ int rec_segment_write(rec_segment_t *seg,
                       const uint8_t *ts_buf, size_t size,
                       uint64_t duration_ns)
 {
-    ssize_t written = write(seg->fd, ts_buf, size);
-    if (written < 0) return -1;
-    seg->written_bytes += (uint64_t)written;
+    /* Loop to handle short writes (e.g. ENOSPC / interrupted write on flash). */
+    size_t remaining = size;
+    const uint8_t *ptr = ts_buf;
+    while (remaining > 0) {
+        ssize_t written = write(seg->fd, ptr, remaining);
+        if (written <= 0) return -1;   /* error or unexpected EOF */
+        ptr       += (size_t)written;
+        remaining -= (size_t)written;
+    }
+    seg->written_bytes += (uint64_t)size;
     seg->cumulative_ns += duration_ns;
     seg->last_flush_ns += duration_ns;
 

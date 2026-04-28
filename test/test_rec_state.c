@@ -177,7 +177,7 @@ static void test_post_wait_retrigger(void)
     /* New START arrives during post-roll (debounce window > 500ms, use +600ms) */
     rec_state_on_trigger(&ctx, REC_TRIGGER_START, t + 1600000000ULL);
     CHECK("back_to_in_event",  ctx.state == REC_STATE_IN_EVENT);
-    CHECK("pending_true",      ctx.pending_trigger == true);
+    CHECK("pending_false",     ctx.pending_trigger == false);  /* fix M3: must be false so POST_WAIT timer can expire */
 
     rec_buf_destroy(&buf);
 }

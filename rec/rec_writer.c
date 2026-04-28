@@ -59,10 +59,16 @@ int rec_writer_enqueue(rec_writer_t *w, rec_write_item_t item)
 {
     if (item.is_shutdown_sentinel) {
         /* Spin until a slot is free, then enqueue the sentinel.
-         * The writer always has a pending eventfd signal when the queue is
-         * full (the flood signals at least once), so this spin exits quickly. */
+         * Bounded to prevent deadlock if the writer thread has already
+         * exited abnormally and will never drain the queue. */
         uint32_t tail, next;
+        int iters = 0;
         do {
+            if (++iters > REC_WRITE_QUEUE_DEPTH * 10000) {
+                /* Writer thread appears stuck or dead; give up.
+                 * rec_writer_destroy will close eventfd to unblock it. */
+                return REC_ERR_WRITER_STUCK;
+            }
             tail = atomic_load_explicit(&w->write_queue.tail,
                                         memory_order_relaxed);
             next = (tail + 1) % REC_WRITE_QUEUE_DEPTH;
@@ -128,9 +134,15 @@ void rec_writer_destroy(rec_writer_t **wp)
     if (!wp || !*wp) return;
     rec_writer_t *w = *wp;
     rec_write_item_t sentinel = { .is_shutdown_sentinel = true };
-    rec_writer_enqueue(w, sentinel);
+    if (rec_writer_enqueue(w, sentinel) != REC_OK) {
+        /* Sentinel spin timed out — writer thread is stuck or dead.
+         * Close eventfd so the read() in writer_thread returns <= 0,
+         * breaking the loop and allowing pthread_join to complete. */
+        close(w->eventfd);
+        w->eventfd = -1;
+    }
     pthread_join(w->thread, NULL);
-    close(w->eventfd);
+    if (w->eventfd >= 0) close(w->eventfd);
     free(w);
     *wp = NULL;
 }

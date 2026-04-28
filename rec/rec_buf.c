@@ -305,9 +305,9 @@ int rec_buf_extract_from_keyframe(rec_buf_t *buf,
     uint32_t pre_gen = atomic_fetch_add_explicit(&buf->next_pre_gen, 1,
                                                   memory_order_relaxed) + 1;
 
-    /* Reset aborted_pre_gen */
-    atomic_store_explicit(&buf->aborted_pre_gen, REC_PRE_GEN_NONE,
-                           memory_order_release);
+    /* NOTE: aborted_pre_gen is cleared AFTER enqueuing new entries (below).
+     * Clearing it here would let the writer skip the abort check on stale
+     * entries that may still be in the pre_queue from the previous batch. */
 
     /* ── Compute protect window: from start_idx.offset to write_pos ─ */
     uint32_t prot_off  = buf->index[(uint32_t)start_idx].offset;
@@ -362,6 +362,13 @@ int rec_buf_extract_from_keyframe(rec_buf_t *buf,
                                memory_order_release);
         count++;
     }
+
+    /* All new entries are tagged with pre_gen; old aborted entries remain
+     * identifiable by their batch_gen until we clear the abort sentinel here.
+     * The writer will have snapshot-ed aborted_pre_gen at drain-loop start,
+     * so stale entries are correctly skipped even after this store. */
+    atomic_store_explicit(&buf->aborted_pre_gen, REC_PRE_GEN_NONE,
+                           memory_order_release);
 
     *batch_gen_out = pre_gen;
     return count;

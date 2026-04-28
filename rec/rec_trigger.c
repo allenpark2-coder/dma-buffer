@@ -1,6 +1,7 @@
 /* rec/rec_trigger.c — Unix abstract-namespace socket listener */
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/time.h>
 #include <stddef.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -82,6 +83,12 @@ void rec_trigger_handle_accept(rec_trigger_t *t)
     int conn = accept4(t->listen_fd, NULL, NULL, SOCK_CLOEXEC);
     if (conn < 0)
         return;
+
+    /* Bound blocking time: a slow/malicious sender must not stall the
+     * epoll event loop.  1-second timeout is generous for a local IPC
+     * message of a few bytes. */
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     vfr_event_msg_t msg;
     ssize_t n = recv(conn, &msg, sizeof(msg), MSG_WAITALL);
