@@ -343,6 +343,7 @@ check_r3_ffprobe: test_rec_writer
 # ── Phase R4 — Schedule + Engine integration ──────────────────────────────────
 SRCS_REC_ENGINE = \
     rec/rec_schedule.c \
+    rec/rec_metrics.c \
     rec/rec_ts_mux.c \
     rec/rec_segment.c \
     rec/rec_buf.c \

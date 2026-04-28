@@ -5,6 +5,7 @@
 #include "rec_writer.h"
 #include "rec_trigger.h"
 #include "rec_schedule.h"
+#include "rec_metrics.h"
 #include "rec_defs.h"
 
 #include <stdlib.h>
@@ -38,6 +39,9 @@ struct rec_engine {
      * is_segment_boundary = true so the Writer opens a fresh segment / clip.
      */
     bool                segment_open_pending;
+
+    /* Prometheus metrics HTTP endpoint (NULL if metrics_port == 0) */
+    rec_metrics_t      *metrics;
 };
 
 /* ─── Forward declarations ──────────────────────────────────────────────────── */
@@ -45,6 +49,20 @@ static void engine_on_transition(void *ud, rec_state_t from, rec_state_t to);
 static bool engine_is_schedule_active(void *ud);
 static bool should_write_live(const rec_engine_t *eng);
 static int  create_timer_fd(void);
+
+/* ─── Metrics value-provider callbacks ─────────────────────────────────────── */
+static rec_state_t metrics_get_state(void *ud)
+{
+    return rec_engine_get_state((const rec_engine_t *)ud);
+}
+static uint64_t metrics_get_written_bytes(void *ud)
+{
+    return rec_engine_get_written_bytes((const rec_engine_t *)ud);
+}
+static uint32_t metrics_get_dropped_frames(void *ud)
+{
+    return rec_engine_get_dropped_frames((const rec_engine_t *)ud);
+}
 
 /* ─── Trigger callback: called by rec_trigger when a message arrives ─────────── */
 static void engine_on_trigger(void *ud, rec_trigger_type_t type, uint64_t ts_ns)
@@ -216,6 +234,18 @@ rec_engine_t *rec_engine_create(const rec_config_t *cfg)
     if (cfg->default_mode == REC_MODE_CONTINUOUS)
         eng->segment_open_pending = true;
 
+    /* 9. Prometheus metrics endpoint (optional) */
+    if (cfg->metrics_port > 0) {
+        eng->metrics = rec_metrics_create(cfg->stream_name, cfg->metrics_port);
+        if (eng->metrics) {
+            rec_metrics_set_providers(eng->metrics, eng,
+                                      metrics_get_state,
+                                      metrics_get_written_bytes,
+                                      metrics_get_dropped_frames);
+        }
+        /* Non-fatal: if metrics creation fails, recording still works */
+    }
+
     return eng;
 
 fail:
@@ -240,6 +270,10 @@ int rec_engine_get_epoll_fds(rec_engine_t *eng, int *fds_out, int max_fds)
     int trig_fd = eng->trigger ? rec_trigger_get_fd(eng->trigger) : -1;
     if (trig_fd >= 0 && n < max_fds)
         fds_out[n++] = trig_fd;
+
+    int met_fd = eng->metrics ? rec_metrics_get_fd(eng->metrics) : -1;
+    if (met_fd >= 0 && n < max_fds)
+        fds_out[n++] = met_fd;
 
     return n;
 }
@@ -284,6 +318,13 @@ int rec_engine_handle_event(rec_engine_t *eng, int fd)
     int trig_fd = eng->trigger ? rec_trigger_get_fd(eng->trigger) : -1;
     if (trig_fd >= 0 && fd == trig_fd) {
         rec_trigger_handle_accept(eng->trigger);
+        return REC_OK;
+    }
+
+    /* Prometheus metrics scrape */
+    int met_fd = eng->metrics ? rec_metrics_get_fd(eng->metrics) : -1;
+    if (met_fd >= 0 && fd == met_fd) {
+        rec_metrics_serve_one(eng->metrics);
         return REC_OK;
     }
 
@@ -374,6 +415,7 @@ void rec_engine_destroy(rec_engine_t **engp)
     }
 
     rec_trigger_destroy(&eng->trigger);
+    rec_metrics_destroy(&eng->metrics);
     rec_buf_destroy(&eng->ring);
 
     free(eng);

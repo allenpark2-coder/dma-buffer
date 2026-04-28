@@ -21,6 +21,7 @@ typedef struct {
     uint32_t          ring_buf_size;     /* 0 → REC_BUF_SIZE_DEFAULT */
     uint32_t          flush_interval_sec;
     char              output_dir[256];
+    uint16_t          metrics_port;      /* TCP port for Prometheus scraping (0 = disabled) */
 } rec_config_t;
 
 /*

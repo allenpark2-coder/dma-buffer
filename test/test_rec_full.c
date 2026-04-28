@@ -8,12 +8,13 @@
  *   T4  SCHEDULED mode: slot OFF → no write; slot ON → write
  *   T5  rec_engine_destroy(): clean shutdown, no double-free
  *   T6  Write-queue overflow: dropped_frames increments correctly
+ *   T7  Prometheus metrics: HTTP scrape returns correct metric names + values
  *
  * Build (no VFR dependency):
  *   gcc -std=c11 -D_GNU_SOURCE -Wall -I. -Irec -Iinclude \
- *       rec/rec_schedule.c rec/rec_buf.c rec/rec_debounce.c rec/rec_state.c \
- *       rec/rec_trigger.c rec/rec_ts_mux.c rec/rec_segment.c rec/rec_writer.c \
- *       rec/rec_engine.c test/test_rec_full.c -lpthread -o test_rec_full
+ *       rec/rec_schedule.c rec/rec_metrics.c rec/rec_buf.c rec/rec_debounce.c \
+ *       rec/rec_state.c rec/rec_trigger.c rec/rec_ts_mux.c rec/rec_segment.c \
+ *       rec/rec_writer.c rec/rec_engine.c test/test_rec_full.c -lpthread -o test_rec_full
  */
 
 #include <stdio.h>
@@ -26,6 +27,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/epoll.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include <dirent.h>
 #include <time.h>
@@ -495,6 +498,108 @@ static void test_write_queue_overflow(void)
     rec_engine_destroy(&eng);
 }
 
+/* ─── T7: Prometheus metrics HTTP scrape ───────────────────────────────────── */
+
+#define METRICS_PORT 19200   /* distinct from vfr_metrics default (9100) */
+
+static void test_prometheus_metrics(void)
+{
+    printf("\nT7: Prometheus metrics HTTP scrape\n");
+
+    clean_dir(OUT_DIR);
+
+    rec_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.stream_name, sizeof(cfg.stream_name), "%s", "met_test");
+    snprintf(cfg.output_dir,  sizeof(cfg.output_dir),  "%s", OUT_DIR);
+    cfg.default_mode  = REC_MODE_CONTINUOUS;
+    cfg.ring_buf_size = REC_BUF_SIZE_MIN;
+    cfg.metrics_port  = METRICS_PORT;
+
+    rec_engine_t *eng = rec_engine_create(&cfg);
+    CHECK("create engine with metrics_port", eng != NULL);
+    if (!eng) return;
+
+    /* Metrics listen fd must appear in get_epoll_fds */
+    int fds[REC_MAX_EPOLL_FDS];
+    int nfds = rec_engine_get_epoll_fds(eng, fds, REC_MAX_EPOLL_FDS);
+    /* Expect: timerfd + trigger_fd + metrics_fd = at least 2 */
+    CHECK("get_epoll_fds returns ≥ 2 fds (timer + metrics)", nfds >= 2);
+
+    /* Push frames so written_bytes > 0 */
+    push_codec_config(eng);
+    uint64_t ts = 5000000000ull, seq = 1;
+    push_frames(eng, 30, &ts, &seq);
+    usleep(100000);   /* let writer drain */
+    CHECK("written_bytes > 0 before scrape",
+          rec_engine_get_written_bytes(eng) > 0);
+
+    /*
+     * Synchronous scrape without a second thread:
+     *
+     *   1. Client socket: connect (kernel accepts TCP SYN immediately via
+     *      the listen backlog, so connect() returns before handle_event).
+     *   2. Client: send the GET request into the kernel TX buffer.
+     *   3. Engine:  handle_event → accept4 + recv(GET) + send(response) + close.
+     *      The GET data is already in the RX buffer, so recv() returns immediately.
+     *      The response lands in the client's RX buffer before close().
+     *   4. Client: recv reads the response that the kernel already buffered.
+     */
+    int cfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK("open client socket for scrape", cfd >= 0);
+    if (cfd < 0) { rec_engine_destroy(&eng); return; }
+
+    struct sockaddr_in sa = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(METRICS_PORT),
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    int conn_ok = (connect(cfd, (struct sockaddr *)&sa, sizeof(sa)) == 0);
+    CHECK("connect to metrics port", conn_ok);
+
+    if (conn_ok) {
+        /* Send GET — data lands in kernel buffers immediately */
+        const char *req = "GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n";
+        send(cfd, req, strlen(req), MSG_NOSIGNAL);
+
+        /* Engine serves the queued connection.
+         * Call handle_event on every fd — only the matching one reacts. */
+        for (int i = 0; i < nfds; i++)
+            rec_engine_handle_event(eng, fds[i]);
+
+        /* Server has already sent the response and closed its side.
+         * Read until EOF so we get the full body. */
+        char rbuf[4096];
+        ssize_t n = 0, r;
+        while ((r = recv(cfd, rbuf + n, sizeof(rbuf) - 1 - (size_t)n, 0)) > 0)
+            n += r;
+        rbuf[n] = '\0';
+
+        CHECK("response received (> 0 bytes)", n > 0);
+        CHECK("HTTP 200 OK in response",
+              strstr(rbuf, "200 OK") != NULL);
+        CHECK("metric rec_written_bytes_total present",
+              strstr(rbuf, "rec_written_bytes_total") != NULL);
+        CHECK("metric rec_drop_frames_total present",
+              strstr(rbuf, "rec_drop_frames_total") != NULL);
+        CHECK("metric rec_state present",
+              strstr(rbuf, "rec_state{") != NULL);
+        CHECK("stream label 'met_test' in output",
+              strstr(rbuf, "met_test") != NULL);
+        /* written_bytes must be non-zero: the line must NOT end with "} 0\n" */
+        CHECK("rec_written_bytes_total value > 0",
+              strstr(rbuf, "rec_written_bytes_total{stream=\"met_test\"} 0\n") == NULL
+              && strstr(rbuf, "rec_written_bytes_total") != NULL);
+
+        const char *body = strstr(rbuf, "\r\n\r\n");
+        if (body) printf("    --- metrics body ---\n%s\n", body + 4);
+    }
+    close(cfd);
+
+    rec_engine_destroy(&eng);
+    CHECK("destroy metrics engine", eng == NULL);
+}
+
 /* ─── main ─────────────────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -508,6 +613,7 @@ int main(void)
     test_scheduled_mode();
     test_destroy_idempotent();
     test_write_queue_overflow();
+    test_prometheus_metrics();
 
     printf("\n=== Results: %d PASS / %d FAIL ===\n", g_pass, g_fail);
 
