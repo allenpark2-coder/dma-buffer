@@ -1221,5 +1221,134 @@ void vfr_metrics_destroy(vfr_metrics_t **m);
 
 ---
 
+## 停車場概念在現實世界中的對應
+
+這個「智慧停車場」系統裡幾乎每一個設計決策，都有對應的現實世界系統或主流程式設計模式。
+
+### 1. Buffer Pool（停車位管理）→ 連線池 / 物件池
+
+停車場預先劃好固定車位、循環使用，這就是**物件池（Object Pool）**模式。
+
+| 停車場 | 現實對應 |
+|---|---|
+| 車位（Slot） | 資料庫連線池（PostgreSQL pgBouncer）的「連線」 |
+| `acquire()` 取一個空位 | 從 thread pool 借一個 worker thread |
+| `refcount` 歸零還回去 | C++ `shared_ptr` 的引用計數歸零自動釋放 |
+| `VFR_MAX_SLOTS = 64` | nginx 的 `worker_connections` 上限 |
+
+**核心思想**：「預先分配，反覆循環使用，避免頻繁 malloc/free 的開銷。」
+
+---
+
+### 2. Registry（看板）→ 服務發現
+
+VFR Registry 的「登記 → 查表 → 連線」流程，和現代微服務架構一模一樣：
+
+| 停車場 | 現實對應 |
+|---|---|
+| `vfr_registry_serve_forever()` | **Consul / etcd / ZooKeeper**（服務發現中心） |
+| `vfr_registry_register()` | 微服務啟動時向 Consul 注册自己 |
+| `vfr_registry_list()` | Kubernetes 的 `kubectl get services` |
+| `vfr_registry_unregister()` | Pod 關閉時從 etcd 移除 endpoint |
+
+DNS 也是同樣的邏輯——你不需要記 IP，問 DNS 就知道在哪。
+
+---
+
+### 3. 背壓策略（Backpressure）→ 流量控制
+
+這是現代系統設計最重要的概念之一：
+
+| 停車場策略 | 現實對應 |
+|---|---|
+| `DROP_OLDEST`（拖走最舊的車） | Kafka consumer 落後太多時，**earliest offset reset** |
+| `BLOCK_PRODUCER`（叫生產者等） | TCP **滑動視窗（Flow Control）**：receiver buffer 滿了，傳 window=0 |
+| `SKIP_SELF`（跳過這位客戶） | RxJava / Reactive Streams 的 `onBackpressureDrop()` |
+
+Netflix 的 **Hystrix**、Go 的 **channel**（`chan` 滿了會阻塞 sender）都是背壓設計。
+
+---
+
+### 4. eventfd（呼叫器）→ 發布 / 訂閱
+
+「生產者按鈴，消費者被動等待」就是 **Pub/Sub 模式**：
+
+| 停車場 | 現實對應 |
+|---|---|
+| `vfr_sync_notify()` → `eventfd` | **Kafka** producer 寫入 topic |
+| Consumer 的 `epoll_wait` 等呼叫器 | Kafka consumer 的 `poll()` |
+| `EFD_SEMAPHORE`：N 次 write = N 次可 read | Redis `LPUSH` / `BLPOP` 計數語意 |
+| 每個 Consumer 各有獨立 eventfd | Kafka 每個 consumer group 獨立 offset |
+
+**Node.js 的 Event Loop** 也是一樣：用 `epoll`/`kqueue` 等待 IO 事件，不輪詢。
+
+---
+
+### 5. SCM\_RIGHTS 傳遞 FD（時空傳送盒）→ 零拷貝 + 能力型安全
+
+把「鑰匙」傳給別人，而不是傳「車子本體」，這叫 **Zero-Copy** + **Capability-Based Security**：
+
+| 停車場 | 現實對應 |
+|---|---|
+| 傳 `dma_fd`，影像不動 | Linux `sendfile()`：檔案 bytes 不過 userspace |
+| SCM\_RIGHTS 跨 process 傳 fd | Android Binder 傳 `FileDescriptor` 給其他 App |
+| Consumer 拿到 fd 才能讀影像 | macOS Sandbox：你拿到 file descriptor 才有存取權 |
+
+**DPDK / io\_uring** 的零拷貝網路也是同樣思想——數據不搬，傳「指向它的憑証」。
+
+---
+
+### 6. pidfd / Watchdog（心跳監測）→ 健康檢查
+
+「客戶猝死，立刻清理」的機制在現實中無處不在：
+
+| 停車場 | 現實對應 |
+|---|---|
+| `pidfd_open()` 監控 Consumer PID | **Kubernetes liveness probe**（container 死了重啟） |
+| `teardown_session()` 自動清理 | **systemd** 監控 service，死了自動 `Restart=always` |
+| Watchdog 不需輪詢，kernel 即時通知 | **AWS ELB Health Check**（偵測到 instance 掛掉，從 target group 移除） |
+
+---
+
+### 7. 環形緩衝器（行車記錄器）→ 到處都是
+
+`rec_buf` 的「新資料蓋掉最舊的」模式是嵌入式與系統程式中最古老的資料結構之一：
+
+| 停車場 | 現實對應 |
+|---|---|
+| pre-roll ring buffer | 監控攝影機的**行車記錄器**（覆蓋式 SD 卡錄影） |
+| `rec_buf_extract_from_keyframe()` | 飛機**黑盒子**：事故後取出事發前 N 分鐘 |
+| Linux kernel `kfifo` | 網路 driver 的 packet ring buffer（`AF_PACKET` TPACKET） |
+| 音訊 DAW 的 buffer | Pro Tools / GarageBand 的 ring buffer 避免爆音 |
+
+---
+
+### 8. 狀態機（值班警衛）→ 幾乎所有業務邏輯
+
+`rec_state` 的五個狀態轉換，和以下系統同構：
+
+| 停車場狀態 | 現實對應 |
+|---|---|
+| `IDLE → WAIT_KEYFRAME` | 紅綠燈：紅燈 → 等綠燈（等 I-Frame = 等可以通行的起點） |
+| `IN_EVENT → POST_WAIT` | 電梯門：有人進出 → 門等 N 秒後才關 |
+| Redux / XState | 前端狀態管理：`IDLE / LOADING / SUCCESS / ERROR` |
+| TCP 狀態機 | `LISTEN → SYN_RCVD → ESTABLISHED → FIN_WAIT → CLOSED` |
+
+---
+
+### 小結：永恆的計算機科學原語
+
+整個 VFR 系統其實是把以下幾個**永恆的計算機科學原語**組合在一起：
+
+```
+物件池 + 服務發現 + 背壓 + Pub-Sub + 零拷貝 + 健康檢查 + 環形緩衝 + 狀態機
+```
+
+這些概念從 1970 年代的 Unix 一直延續到今天的 Kubernetes、Kafka、Rust async，
+**本質從未改變**，只是換了包裝。這也是為什麼學好底層 Linux 系統程式設計，
+看現代雲端架構時會覺得「這不就是 XXX 嘛」。
+
+---
+
 *文件自動從源碼標頭與 docs/ 整合產生。如有架構變更，請同步更新本文件。*
 *Last updated: 2026-04-30*
